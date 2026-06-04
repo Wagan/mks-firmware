@@ -1,0 +1,28 @@
+# --- STM32CubeIDE build output ---
+/Debug/
+/Release/
+**/Debug/
+**/Release/
+*.o
+*.d
+*.su
+*.elf
+*.bin
+*.hex
+*.map
+*.list
+
+# --- Eclipse/CubeIDE workspace metadata ---
+.settings/
+.metadata/
+*.launch
+
+# --- OS / editor junk ---
+.DS_Store
+Thumbs.db
+*~
+*.bak
+*.swp
+
+# --- Keep these (do NOT ignore): ---
+# .project, .cproject, *.ioc, *.ld  -- эти файлы коммитим
