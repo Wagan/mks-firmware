@@ -96,10 +96,14 @@ static dwt_local_data_t *pdw1000local = dw1000local ; // Static local data struc
  *
  * returns DWT_SUCCESS for success, or DWT_ERROR for error
  */
+/* NCPR FIX (2026-07-06): corrected inverted bounds check in dwt_setlocaldataptr().
+   Original: if (DWT_NUM_DW_DEV > index) â€” returned error for valid indices.
+   Vendor DecaDriver v4.0.6 bug. Re-apply this fix when updating the driver. */
 int dwt_setlocaldataptr(unsigned int index)
 {
     // Check the index is within the array bounds
-    if (DWT_NUM_DW_DEV > index) // return error if index outside the array bounds
+    // NCPR FIX: was `if (DWT_NUM_DW_DEV > index)` â€” inverted check (vendor bug)
+    if (index >= DWT_NUM_DW_DEV) // return error if index outside the array bounds
     {
         return DWT_ERROR ;
     }
@@ -611,8 +615,8 @@ void dwt_settxantennadelay(uint16 txDelay)
  *                         standard PHR mode allows up to 127 bytes
  *                         if > 127 is programmed, DWT_PHRMODE_EXT needs to be set in the phrMode configuration
  *                         see dwt_configure function
- * @param txFrameBytes   - Pointer to the user’s buffer containing the data to send.
- * @param txBufferOffset - This specifies an offset in the DW1000’s TX Buffer at which to start writing data.
+ * @param txFrameBytes   - Pointer to the userï¿½s buffer containing the data to send.
+ * @param txBufferOffset - This specifies an offset in the DW1000ï¿½s TX Buffer at which to start writing data.
  *
  * output parameters
  *
@@ -2690,7 +2694,7 @@ void dwt_syncrxbufptrs(void)
  * @param enable - 1 to enable SNIFF mode, 0 to disable. When 0, all other parameters are not taken into account.
  * @param timeOn - duration of receiver ON phase, expressed in multiples of PAC size. The counter automatically adds 1 PAC
  *                 size to the value set. Min value that can be set is 1 (i.e. an ON time of 2 PAC size), max value is 15.
- * @param timeOff - duration of receiver OFF phase, expressed in multiples of 128/125 µs (~1 µs). Max value is 255.
+ * @param timeOff - duration of receiver OFF phase, expressed in multiples of 128/125 ï¿½s (~1 ï¿½s). Max value is 255.
  *
  * output parameters
  *
@@ -2770,9 +2774,9 @@ void dwt_setlowpowerlistening(int enable)
  * @brief Set duration of "short sleep" phase when in low-power listening mode.
  *
  * input parameters:
- * @param snooze_time - "short sleep" phase duration, expressed in multiples of 512/19.2 µs (~26.7 µs). The counter
+ * @param snooze_time - "short sleep" phase duration, expressed in multiples of 512/19.2 ï¿½s (~26.7 ï¿½s). The counter
  *                      automatically adds 1 to the value set. The smallest working value that should be set is 1,
- *                      i.e. giving a snooze time of 2 units (or ~53 µs).
+ *                      i.e. giving a snooze time of 2 units (or ~53 ï¿½s).
  *
  * output parameters
  *

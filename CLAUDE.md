@@ -79,6 +79,13 @@ Drivers/decadriver/ — официальный DecaDriver 4.0.6 (НЕ модиф
   `dwt_setlocaldataptr(idx)` И запоминает шину/CS. Затем обычные `dwt_*` вызовы.
 - Платформенные функции, которые мы реализуем (в deca_port.c):
   `writetospi`, `readfromspi`, `deca_sleep`, `decamutexon/off`.
+- **ИСКЛЮЧЕНИЕ из правила «не трогать vendor»:** в `deca_device.c` исправлен баг
+  vendor-драйвера в `dwt_setlocaldataptr()` — была инвертированная проверка границ
+  (`if (DWT_NUM_DW_DEV > index)`), из-за чего функция возвращала `DWT_ERROR` для
+  любого валидного индекса и ломала выбор устройства. Исправлено на
+  `if (index >= DWT_NUM_DW_DEV)`, помечено маркером `NCPR FIX`. Это единственная
+  санкционированная правка в `Drivers/decadriver/`; **при обновлении DecaDriver
+  правку нужно перенести заново.**
 
 ## Решения по протоколу (для будущих этапов)
 - CRC8: полином 0x07, init 0x00, без рефлексии/xorout. Покрытие — **LEN+CMD_ID+PARAMS
