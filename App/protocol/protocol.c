@@ -139,6 +139,28 @@ static void PROTOCOL_SendResponse(ResponseStatus status, const uint8_t* data, ui
 }
 
 /* ===========================================================================
+ * RX-КОЛЬЦЕВОЙ БУФЕР (наш код, App/)
+ * ===========================================================================
+ * Развязка контекстов: USB-прерывание (CDC_Receive_FS) только КЛАДЁТ байты сюда
+ * (PROTOCOL_RxPush), а main loop ВЫГРЕБАЕТ и разбирает (PROTOCOL_PollRx). Это
+ * убирает блокирующие HAL_Delay (INIT/reset/TX/RX) из ISR — они исполняются в
+ * thread mode, где SysTick тикает. См. docs/REPORT_init_hang_usb_isr_diagnosis.md.
+ *
+ * SPSC (single-producer / single-consumer): rx_head пишет только ISR, rx_tail —
+ * только поток; 16-битные индексы на Cortex-M4 читаются/пишутся атомарно, блокировка
+ * не нужна. Размер — степень двойки (маска вместо остатка). Политика переполнения:
+ * отбрасывать НОВЫЕ байты (старое принятое не теряем — при переполнении main loop
+ * занят долгой командой), счётчик rx_overflow — для диагностики.
+ */
+#define RX_RING_SIZE  512u
+#define RX_RING_MASK  (RX_RING_SIZE - 1u)
+
+static volatile uint8_t  rx_ring[RX_RING_SIZE];
+static volatile uint16_t rx_head;      /* индекс записи — пишет ISR */
+static volatile uint16_t rx_tail;      /* индекс чтения — читает main loop */
+static volatile uint32_t rx_overflow;  /* число отброшенных байт при переполнении */
+
+/* ===========================================================================
  * ПАРСЕР ВХОДЯЩИХ БАЙТОВ
  * =========================================================================== */
 
@@ -146,6 +168,10 @@ void PROTOCOL_Init(void)
 {
     parser.state = STATE_WAIT_SYNC1;
     parser.index = 0;
+
+    rx_head     = 0;
+    rx_tail     = 0;
+    rx_overflow = 0;
 }
 
 void PROTOCOL_ProcessByte(uint8_t byte)
@@ -234,6 +260,40 @@ void PROTOCOL_ProcessByte(uint8_t byte)
             parser.state = STATE_WAIT_SYNC1;
             break;
     }
+}
+
+/* ===========================================================================
+ * RX-КОЛЬЦО: ЗАПИСЬ (ISR) / ЧТЕНИЕ (main loop)
+ * =========================================================================== */
+
+void PROTOCOL_RxPush(uint8_t byte)
+{
+    uint16_t next = (uint16_t)((rx_head + 1u) & RX_RING_MASK);
+
+    if (next == rx_tail) {
+        /* Кольцо полно — отбрасываем НОВЫЙ байт, старые не трогаем. */
+        rx_overflow++;
+        return;
+    }
+
+    rx_ring[rx_head] = byte;
+    rx_head = next;
+}
+
+void PROTOCOL_PollRx(void)
+{
+    /* Байты, пришедшие во время разбора, останутся в кольце до следующего
+     * вызова — это нормально (main loop может быть занят долгой командой). */
+    while (rx_tail != rx_head) {
+        uint8_t byte = rx_ring[rx_tail];
+        rx_tail = (uint16_t)((rx_tail + 1u) & RX_RING_MASK);
+        PROTOCOL_ProcessByte(byte);
+    }
+}
+
+uint32_t PROTOCOL_RxOverflowCount(void)
+{
+    return rx_overflow;
 }
 
 /* ===========================================================================

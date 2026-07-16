@@ -101,6 +101,17 @@ void PROTOCOL_Init(void);
 /* Обработка входящего байта из USB */
 void PROTOCOL_ProcessByte(uint8_t byte);
 
+/* Положить принятый байт в rx-кольцо. Вызывается из USB-прерывания
+ * (CDC_Receive_FS). Короткая неблокирующая операция. */
+void PROTOCOL_RxPush(uint8_t byte);
+
+/* Выгрести накопленные байты из rx-кольца и разобрать их (→ обработчики).
+ * Вызывается из main loop (thread mode), где HAL_Delay/deca_sleep работают. */
+void PROTOCOL_PollRx(void);
+
+/* Число отброшенных при переполнении rx-кольца байт (диагностика). */
+uint32_t PROTOCOL_RxOverflowCount(void);
+
 /* Построение пакета ответа */
 uint8_t* PROTOCOL_BuildResponsePacket(ResponseStatus status, const uint8_t* data,
                                        uint8_t data_len, uint8_t* packet_len);
