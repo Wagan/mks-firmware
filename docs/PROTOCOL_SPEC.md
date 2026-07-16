@@ -6,6 +6,11 @@
 **Проверено на железе (2026-07-16):** команды `PING` / `INIT` / `GET_STATUS`
 проверены end-to-end на плате МКС по USB CDC (COM3) через `tools/mks_*_test.py`:
 PING→PONG, INIT→OK (оба модуля DWM1000 инициализированы), GET_STATUS→7 байт.
+**Приёмный тракт проверен на железе (2026-07-16):** `RX_START` / `GET_SIGNAL_METRICS`
+проверены против эталонного передатчика **EVK1000 (Mode 3, 0.7 м LOS)** через
+`tools/mks_console.py`. Последовательность INIT→SET_PHY_CONFIG(Mode3)→RX_START→
+metrics дала растущий `count` (48→81→138) и физичные метрики (CIR_PWR ~9000,
+RXPACC ~270, FP_AMPL1..3 ~16000–18000). Слушающий модуль — M2 (по умолчанию).
 
 > **Источник истины — реализация.** Этот документ описывает то, что прошивка МКС
 > реально делает. Исходные PDF («Бинарный протокол v1.3», «API v1.3») были
@@ -96,14 +101,14 @@ PING→PONG, INIT→OK (оба модуля DWM1000 инициализирова
 | 0x01 | INIT | Системные | ✅ 🔬 |
 | 0x02 | GET_STATUS | Системные | ✅ 🔬 |
 | 0x03 | RESET_RADIO | Системные | 📋 |
-| 0x10 | SET_PHY_CONFIG | Конфигурация | 📋 |
+| 0x10 | SET_PHY_CONFIG | Конфигурация | ✅ |
 | 0x11 | SET_TX_POWER | Конфигурация | 📋 |
 | 0x20 | TX_FRAME | Передатчик | 📋 |
 | 0x21 | TX_PERIODIC | Передатчик | 📋 |
 | 0x22 | TX_STOP | Передатчик | 📋 |
-| 0x30 | RX_START | Приёмник | 📋 |
-| 0x31 | RX_STOP | Приёмник | 📋 |
-| 0x40 | GET_SIGNAL_METRICS | Диагностика | 📋 |
+| 0x30 | RX_START | Приёмник | ✅ 🔬 |
+| 0x31 | RX_STOP | Приёмник | ✅ 🔬 |
+| 0x40 | GET_SIGNAL_METRICS | Диагностика | ✅ 🔬 |
 | 0x41 | GET_CIR | Диагностика | 📋 |
 | 0x50 | START_EXPERIMENT | Эксперименты | 📋 |
 | 0x51 | STOP_EXPERIMENT | Эксперименты | 📋 |
@@ -206,9 +211,43 @@ DATA (7 байт), из кэша по модулю M1:
 | preamble_length | u16 (LE) | из кэша |
 | PRF | u8 | из кэша |
 
+### RX_START (0x30) / RX_STOP (0x31) — ✅ 🔬
+Параметров нет. DATA нет. `RX_START` включает непрерывный приём на модуле
+`DW_RX_LISTEN_DEV` (board_config; по умолчанию M2), требует предварительного INIT
+(иначе `RADIO_ERROR`). Приём и разбор кадров — в main loop (`PROTOCOL_PollRadio`,
+опрос SYS_STATUS; EXTI добавим позже). `RX_STOP` — `dwt_forcetrxoff`.
+Проверено на железе (2026-07-16): M2 расслышал EVK1000 Mode 3, свап на M1 не понадобился.
+
+### GET_SIGNAL_METRICS (0x40) — ✅ 🔬 ⚠️ ИНТЕРИМ-формат
+Пока кадра не принято → `TIMEOUT`. Иначе DATA (**18 байт, u16 LE**) — сырые поля
+`dwt_rxdiag_t` последнего кадра:
+
+| Смещение | Поле | Источник (dwt_rxdiag_t) |
+|---|---|---|
+| 0..1 | count (число принятых кадров) | счётчик прошивки (отладка) |
+| 2..3 | CIR_PWR | `maxGrowthCIR` |
+| 4..5 | RXPACC | `rxPreamCount` |
+| 6..7 | STD_NOISE | `stdNoise` |
+| 8..9 | FP_AMPL1 | `firstPathAmp1` |
+| 10..11 | FP_AMPL2 | `firstPathAmp2` |
+| 12..13 | FP_AMPL3 | `firstPathAmp3` |
+| 14..15 | FP_INDEX | `firstPath` |
+| 16..17 | MAX_NOISE | `maxNoise` |
+
+> ⚠️ **ИНТЕРИМ.** Это сырые поля для проверки факта приёма и как входы для
+> формул. Итоговый формат — RSSI int16 (dBm×100), SNR int16 (dB×100), RXPACC u16,
+> FP_INDEX u16 — по формулам **DW1000 UM §4.7** (заменит интерим).
+>
+> **Находка для перехода к RSSI (по замерам EVK Mode 3, преамбула 1024):** RXPACC
+> замерен ≈ **261–280** — счётчик насытился рано, т.е. `RXPACC ≠ RXPACC_NOSAT`,
+> значит по UM §4.7 SFD-коррекция N **не требуется**. Но строго это подтвердить
+> нельзя: `RXPACC_NOSAT` в интерим-формате отсутствует. Для RSSI (UM §4.7.2:
+> `RX_LEVEL = 10·log10(C·2^17 / N²) − A`, где `A = 113.77 @PRF16 / 121.74 @PRF64`,
+> `C = CIR_PWR`, `N = RXPACC`) **нужно добавить чтение `RXPACC_NOSAT`** (из
+> `DRX_CONF`/`RXPACC_NOSAT`), чтобы корректно брать N.
+
 ### Форматы ответа запланированных команд (📋, справочно из исходного протокола)
 
-- **GET_SIGNAL_METRICS:** RSSI int16 (dBm×100), SNR int16 (dB×100), RXPACC u16, FP_INDEX u16.
 - **GET_CIR:** N = length; пары I/Q int16: I1,Q1,I2,Q2,…,IN,QN.
 
 Эти форматы будут подтверждены/скорректированы при реализации.
