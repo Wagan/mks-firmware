@@ -12,6 +12,12 @@ mks_protocol.py — библиотека протокола обмена ПК <-
 Чтение сделано короткими порциями в цикле (poll), чтобы:
   - Ctrl+C срабатывал сразу (а не после длинного блокирующего read);
   - таймаут задавался на команду и переживал долгие операции (INIT).
+
+v2 (2026-07-16): добавлен приёмный слой — RX_START(0x30), RX_STOP(0x31),
+GET_SIGNAL_METRICS(0x40) + parse_signal_metrics() под ИНТЕРИМ-формат
+(сырые поля dwt_rxdiag_t, 18 байт, 9x u16 LE, PROTOCOL_SPEC §8).
+RSSI/SNR по формулам DW1000 UM §4.7 — отдельным шагом позже (нужен
+RXPACC_NOSAT, которого в интерим-формате нет).
 """
 
 from __future__ import annotations
@@ -20,12 +26,15 @@ import time
 
 SYNC = bytes([0xAA, 0x55])
 
-CMD_PING             = 0x00
-CMD_INIT             = 0x01
-CMD_GET_STATUS       = 0x02
-CMD_RESET_RADIO      = 0x03
-CMD_SET_PHY_CONFIG   = 0x10
-CMD_SET_TX_POWER     = 0x11
+CMD_PING               = 0x00
+CMD_INIT               = 0x01
+CMD_GET_STATUS         = 0x02
+CMD_RESET_RADIO        = 0x03
+CMD_SET_PHY_CONFIG     = 0x10
+CMD_SET_TX_POWER       = 0x11
+CMD_RX_START           = 0x30
+CMD_RX_STOP            = 0x31
+CMD_GET_SIGNAL_METRICS = 0x40
 
 STATUS_NAMES = {
     0x00: "OK",
@@ -149,6 +158,15 @@ class MKS:
     def get_status(self, timeout=None):
         return self.command(CMD_GET_STATUS, timeout=timeout)
 
+    def rx_start(self, timeout=None):
+        return self.command(CMD_RX_START, timeout=timeout)
+
+    def rx_stop(self, timeout=None):
+        return self.command(CMD_RX_STOP, timeout=timeout)
+
+    def get_signal_metrics(self, timeout=None):
+        return self.command(CMD_GET_SIGNAL_METRICS, timeout=timeout)
+
 
 def parse_get_status(data: bytes) -> dict:
     if len(data) != 7:
@@ -161,3 +179,47 @@ def parse_get_status(data: bytes) -> dict:
         "preamble_length": struct.unpack_from("<H", data, 4)[0],
         "PRF": data[6],
     }
+
+
+# Порядок полей ИНТЕРИМ-формата GET_SIGNAL_METRICS (PROTOCOL_SPEC §8):
+# 18 байт = 9 x u16 LE, сырые поля dwt_rxdiag_t последнего принятого кадра.
+SIGNAL_METRICS_FIELDS = (
+    "count",       # число принятых кадров (счётчик прошивки, отладка)
+    "CIR_PWR",     # maxGrowthCIR  -> "C" в формуле RX_LEVEL (UM §4.7.2)
+    "RXPACC",      # rxPreamCount  -> "N" (может требовать SFD-коррекции)
+    "STD_NOISE",   # stdNoise
+    "FP_AMPL1",    # firstPathAmp1 -> "F1"
+    "FP_AMPL2",    # firstPathAmp2 -> "F2"
+    "FP_AMPL3",    # firstPathAmp3 -> "F3"
+    "FP_INDEX",    # firstPath
+    "MAX_NOISE",   # maxNoise
+)
+
+
+def parse_signal_metrics(data: bytes) -> dict:
+    """Разобрать ИНТЕРИМ-DATA GET_SIGNAL_METRICS (18 байт, 9x u16 LE).
+
+    Возвращает dict сырых полей. Формулы RSSI/SNR тут НЕ считаются —
+    это следующий шаг (UM §4.7), требующий RXPACC_NOSAT.
+    """
+    if len(data) != 18:
+        raise ProtocolError(
+            f"GET_SIGNAL_METRICS: ожидалось 18 байт (интерим), получено {len(data)}"
+        )
+    values = struct.unpack("<9H", data)
+    return dict(zip(SIGNAL_METRICS_FIELDS, values))
+
+
+def signal_metrics_ok(m: dict) -> bool:
+    """Критерий 'кадр реально принят' для проверки на железе.
+
+    valid=1 в прошивке уже гарантирован (иначе был бы STATUS=TIMEOUT),
+    но дополнительно убеждаемся, что ключевые сырые поля ненулевые —
+    это доказывает содержательный приём, а не пустой кадр.
+    """
+    return (
+        m.get("count", 0) > 0
+        and m.get("CIR_PWR", 0) != 0
+        and m.get("RXPACC", 0) != 0
+        and m.get("FP_AMPL1", 0) != 0
+    )
