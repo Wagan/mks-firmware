@@ -14,7 +14,10 @@
 ***************************************************************/
 
 #include "protocol.h"
-#include "usbd_cdc_if.h"   /* CDC_Transmit_FS() — отправка ответа в USB CDC */
+#include "usbd_cdc_if.h"     /* CDC_Transmit_FS() — отправка ответа в USB CDC */
+#include "deca_port.h"       /* deca_port_select_device/hard_reset/spi_set_slow */
+#include "deca_device_api.h" /* dwt_initialise/dwt_readdevid, DWT_LOADUCODE, DWT_SUCCESS */
+#include "board_config.h"    /* DW_DEVICE_COUNT */
 #include <string.h>
 
 /* ===========================================================================
@@ -234,6 +237,109 @@ void PROTOCOL_ProcessByte(uint8_t byte)
 }
 
 /* ===========================================================================
+ * КЭШ СОСТОЯНИЯ УСТРОЙСТВ (наш код, App/)
+ * ===========================================================================
+ * Лёгкий кэш конфигурации каждого DW1000. Назначение: отдавать GET_STATUS без
+ * обращения к чипу и хранить признак успешной инициализации. Заполняется при
+ * INIT (initialized, dev_id) и позже при SET_PHY_CONFIG (channel/data_rate/
+ * preamble_len/prf). На этапе bring-up SET_PHY_CONFIG ещё нет, поэтому после
+ * INIT PHY-поля = 0 (дефолты появятся, когда добавим конфигуратор PHY).
+ * Индексация — по DW_DEV_M1(0)/DW_DEV_M2(1) из board_config.h.
+ * Позже, при вводе radio_manager, кэш можно вынести в общий модуль. */
+typedef struct {
+    uint8_t  initialized;   /* 1 = dwt_initialise() прошёл успешно */
+    uint32_t dev_id;        /* прочитанный DEV_ID (ожидаем 0xDECA0130) */
+    uint8_t  channel;       /* канал (заполнит SET_PHY_CONFIG) */
+    uint8_t  data_rate;     /* скорость данных (raw, wire) */
+    uint16_t preamble_len;  /* длина преамбулы (raw, wire) */
+    uint8_t  prf;           /* PRF (raw, wire) */
+} dw_dev_state_t;
+
+static dw_dev_state_t dw_dev_state[DW_DEVICE_COUNT];
+
+/* ===========================================================================
+ * ОБРАБОТЧИКИ КОМАНД (Шаг 2: PING / INIT / GET_STATUS, синхронно, bare-metal)
+ * =========================================================================== */
+
+/**
+ * @brief PING (0x00). Немедленный ответ, без обращения к чипу.
+ *        DATA = 1 байт 0x00 (PONG), LEN=2. См. PROTOCOL_SPEC §8 (строгий
+ *        вариант «Бинарный протокол §11»: ответ PING — OK uint8).
+ */
+static ResponseStatus HandlePING(const uint8_t* params, uint8_t params_len,
+                                 uint8_t** out_data, uint8_t* out_len)
+{
+    (void)params; (void)params_len;
+    (*out_data)[0] = 0x00;   /* PONG */
+    *out_len = 1;
+    return STATUS_OK;
+}
+
+/**
+ * @brief INIT (0x01). Инициализация всех модулей: аппаратный сброс, медленный
+ *        SPI, dwt_initialise() с загрузкой LDE-микрокода. Результат — в кэш.
+ *        Возвращает STATUS_OK только если инициализированы ВСЕ модули.
+ */
+static ResponseStatus HandleINIT(const uint8_t* params, uint8_t params_len,
+                                 uint8_t** out_data, uint8_t* out_len)
+{
+    (void)params; (void)params_len; (void)out_data;
+    *out_len = 0;
+
+    ResponseStatus status = STATUS_OK;
+
+    for (int i = 0; i < DW_DEVICE_COUNT; i++) {
+        dw_dev_state[i].initialized = 0;
+        dw_dev_state[i].dev_id      = 0;
+
+        if (deca_port_select_device(i) != DWT_SUCCESS) {
+            status = STATUS_RADIO_ERROR;
+            continue;
+        }
+
+        deca_port_hard_reset(i);      /* аппаратный сброс именно этого модуля */
+        deca_port_spi_set_slow();     /* init требует SPI < 3 МГц */
+
+        if (dwt_initialise(DWT_LOADUCODE) != DWT_SUCCESS) {
+            status = STATUS_RADIO_ERROR;
+            continue;
+        }
+
+        dw_dev_state[i].initialized = 1;
+        dw_dev_state[i].dev_id      = dwt_readdevid();
+        /* PHY-поля (channel/data_rate/...) заполнит будущий SET_PHY_CONFIG. */
+    }
+
+    return status;
+}
+
+/**
+ * @brief GET_STATUS (0x02). Отдаёт кэш состояния (без обращения к чипу).
+ *        DATA: TX_state u8, RX_state u8, channel u8, data_rate u8,
+ *              preamble_length u16 (LE), PRF u8  — итого 7 байт (API v1.3).
+ *        Пока рапортуем по модулю M1 (индекс 0); мультимодульный статус — TBD.
+ */
+static ResponseStatus HandleGET_STATUS(const uint8_t* params, uint8_t params_len,
+                                       uint8_t** out_data, uint8_t* out_len)
+{
+    (void)params; (void)params_len;
+    static uint8_t data[7];
+    const dw_dev_state_t* s = &dw_dev_state[DW_DEV_M1];
+
+    data[0] = 0;                              /* TX_state (трекинга пока нет) */
+    data[1] = 0;                              /* RX_state (трекинга пока нет) */
+    data[2] = s->channel;
+    data[3] = s->data_rate;
+    data[4] = s->preamble_len & 0xFF;
+    data[5] = (s->preamble_len >> 8) & 0xFF;
+    data[6] = s->prf;
+
+    *out_data = data;
+    *out_len  = 7;
+    return STATUS_OK;
+}
+
+/* ===========================================================================
  * РЕГИСТРАЦИЯ ОБРАБОТЧИКОВ
  * =========================================================================== */
 void PROTOCOL_RegisterHandler(CommandID cmd, CommandHandler handler)
@@ -248,11 +354,15 @@ void PROTOCOL_RegisterHandler(CommandID cmd, CommandHandler handler)
  * команду ядро отвечает STATUS_UNKNOWN_CMD. Это уже проверяет сквозной тракт
  * USB CDC → парсер → CRC → построитель ответа.
  *
- * Шаг 2: здесь регистрируются PING / INIT / GET_STATUS (синхронно, поверх
- * DecaDriver через deca_port). TX/RX/диагностика/эксперименты — позже, вместе
- * с radio_manager и FreeRTOS.
+ * Шаг 2 (текущий): зарегистрированы PING / INIT / GET_STATUS (синхронно, поверх
+ * DecaDriver через deca_port). Остальные 14 команд НЕ регистрируются —
+ * диспетчер на них отвечает STATUS_UNKNOWN_CMD (заглушка). TX/RX/диагностика/
+ * эксперименты — позже, вместе с radio_manager и FreeRTOS.
  */
 void PROTOCOL_RegisterAllHandlers(void)
 {
-    /* Шаг 2: PROTOCOL_RegisterHandler(CMD_PING, HandlePING); ... */
+    PROTOCOL_RegisterHandler(CMD_PING,       HandlePING);
+    PROTOCOL_RegisterHandler(CMD_INIT,       HandleINIT);
+    PROTOCOL_RegisterHandler(CMD_GET_STATUS, HandleGET_STATUS);
+    /* Остальные CMD_ID остаются NULL → STATUS_UNKNOWN_CMD. */
 }
