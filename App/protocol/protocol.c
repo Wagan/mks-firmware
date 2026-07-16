@@ -16,8 +16,9 @@
 #include "protocol.h"
 #include "usbd_cdc_if.h"     /* CDC_Transmit_FS() — отправка ответа в USB CDC */
 #include "deca_port.h"       /* deca_port_select_device/hard_reset/spi_set_slow */
-#include "deca_device_api.h" /* dwt_initialise/dwt_readdevid, DWT_LOADUCODE, DWT_SUCCESS */
-#include "board_config.h"    /* DW_DEVICE_COUNT */
+#include "deca_device_api.h" /* dwt_initialise/dwt_configure/dwt_rxenable, dwt_readdiagnostics */
+#include "deca_regs.h"       /* SYS_STATUS_ID/RXFCG/ALL_RX_ERR, RX_FINFO_ID, маски */
+#include "board_config.h"    /* DW_DEVICE_COUNT, DW_RX_LISTEN_DEV */
 #include <string.h>
 
 /* ===========================================================================
@@ -161,6 +162,26 @@ static volatile uint16_t rx_tail;      /* индекс чтения — чита
 static volatile uint32_t rx_overflow;  /* число отброшенных байт при переполнении */
 
 /* ===========================================================================
+ * КЭШ ПРИЁМА (наш код, App/)
+ * ===========================================================================
+ * rx_active — приём включён командой RX_START (обслуживается в PROTOCOL_PollRadio).
+ * rx_metrics — метрики последнего успешно принятого кадра (для GET_SIGNAL_METRICS).
+ * Слушаем на модуле DW_RX_LISTEN_DEV (board_config). Триггер приёма на этом этапе —
+ * опрос SYS_STATUS в main loop (EXTI добавим позже, обработка та же). */
+#define RX_FRAME_MAX  128   /* макс. длина принимаемого кадра, что читаем в буфер */
+
+static volatile uint8_t rx_active;   /* 1 = приём включён (RX_START) */
+
+static struct {
+    uint8_t      valid;      /* принят хотя бы один кадр после RX_START */
+    uint16_t     count;      /* число принятых хороших кадров (для отладки) */
+    uint16_t     frame_len;  /* длина последнего кадра */
+    dwt_rxdiag_t diag;       /* сырые метрики последнего кадра (dwt_readdiagnostics) */
+} rx_metrics;
+
+static uint8_t rx_frame[RX_FRAME_MAX];  /* последний принятый кадр */
+
+/* ===========================================================================
  * ПАРСЕР ВХОДЯЩИХ БАЙТОВ
  * =========================================================================== */
 
@@ -172,6 +193,10 @@ void PROTOCOL_Init(void)
     rx_head     = 0;
     rx_tail     = 0;
     rx_overflow = 0;
+
+    rx_active         = 0;
+    rx_metrics.valid  = 0;
+    rx_metrics.count  = 0;
 }
 
 void PROTOCOL_ProcessByte(uint8_t byte)
@@ -318,7 +343,7 @@ typedef struct {
 static dw_dev_state_t dw_dev_state[DW_DEVICE_COUNT];
 
 /* ===========================================================================
- * ОБРАБОТЧИКИ КОМАНД (Шаг 2: PING / INIT / GET_STATUS, синхронно, bare-metal)
+ * ОБРАБОТЧИКИ КОМАНД (синхронно, bare-metal, исполнение в main loop)
  * =========================================================================== */
 
 /**
@@ -527,6 +552,116 @@ static ResponseStatus HandleSET_PHY_CONFIG(const uint8_t* params, uint8_t params
     return STATUS_OK;
 }
 
+/**
+ * @brief RX_START (0x30). Включить непрерывный приём на модуле DW_RX_LISTEN_DEV.
+ *        Требует предварительного INIT. Приём обслуживается в PROTOCOL_PollRadio
+ *        (main loop). dwt_setrxtimeout(0) — без таймаута (слушаем бесконечно).
+ */
+static ResponseStatus HandleRX_START(const uint8_t* params, uint8_t params_len,
+                                     uint8_t** out_data, uint8_t* out_len)
+{
+    (void)params; (void)params_len; (void)out_data;
+    *out_len = 0;
+
+    if (!dw_dev_state[DW_RX_LISTEN_DEV].initialized) return STATUS_RADIO_ERROR;
+    if (deca_port_select_device(DW_RX_LISTEN_DEV) != DWT_SUCCESS) return STATUS_RADIO_ERROR;
+
+    dwt_setrxtimeout(0);                        /* непрерывный приём (без таймаута) */
+    if (dwt_rxenable(DWT_START_RX_IMMEDIATE) != DWT_SUCCESS) return STATUS_RADIO_ERROR;
+
+    rx_metrics.valid = 0;   /* метрики появятся от следующих принятых кадров */
+    rx_active = 1;
+    return STATUS_OK;
+}
+
+/**
+ * @brief RX_STOP (0x31). Остановить приём (dwt_forcetrxoff), снять флаг rx_active.
+ */
+static ResponseStatus HandleRX_STOP(const uint8_t* params, uint8_t params_len,
+                                    uint8_t** out_data, uint8_t* out_len)
+{
+    (void)params; (void)params_len; (void)out_data;
+    *out_len = 0;
+
+    if (deca_port_select_device(DW_RX_LISTEN_DEV) != DWT_SUCCESS) return STATUS_RADIO_ERROR;
+    dwt_forcetrxoff();
+    rx_active = 0;
+    return STATUS_OK;
+}
+
+/**
+ * @brief GET_SIGNAL_METRICS (0x40). Отдать сырые метрики последнего кадра
+ *        (dwt_rxdiag_t). ИНТЕРИМ-формат (18 байт, u16 LE): count, maxGrowthCIR,
+ *        rxPreamCount, stdNoise, firstPathAmp1, firstPathAmp2, firstPathAmp3,
+ *        firstPath, maxNoise. Заменится на RSSI/SNR по формулам UM §4.7.
+ *        Если кадра ещё не было (valid==0) → TIMEOUT.
+ */
+static ResponseStatus HandleGET_SIGNAL_METRICS(const uint8_t* params, uint8_t params_len,
+                                               uint8_t** out_data, uint8_t* out_len)
+{
+    (void)params; (void)params_len;
+
+    if (!rx_metrics.valid) return STATUS_TIMEOUT;   /* кадра ещё не принято */
+
+    static uint8_t data[18];
+    const dwt_rxdiag_t* d = &rx_metrics.diag;
+    uint8_t* p = data;
+
+    PUT_U16LE(p, rx_metrics.count); p += 2;
+    PUT_U16LE(p, d->maxGrowthCIR);  p += 2;
+    PUT_U16LE(p, d->rxPreamCount);  p += 2;
+    PUT_U16LE(p, d->stdNoise);      p += 2;
+    PUT_U16LE(p, d->firstPathAmp1); p += 2;
+    PUT_U16LE(p, d->firstPathAmp2); p += 2;
+    PUT_U16LE(p, d->firstPathAmp3); p += 2;
+    PUT_U16LE(p, d->firstPath);     p += 2;
+    PUT_U16LE(p, d->maxNoise);      p += 2;
+
+    *out_data = data;
+    *out_len  = 18;
+    return STATUS_OK;
+}
+
+/* ===========================================================================
+ * ОБСЛУЖИВАНИЕ ПРИЁМА (main loop) — polling SYS_STATUS
+ * ===========================================================================
+ * Триггер приёма на этом этапе — опрос SYS_STATUS в main loop (EXTI добавим
+ * позже, обработка та же). Разбирает хороший кадр (RXFCG) и ошибки (ALL_RX_ERR),
+ * кэширует метрики, перевключает непрерывный приём. Набор регистров/флагов — как
+ * в референсе docs/reference/decawave-examples/ss_resp_main.c.
+ */
+void PROTOCOL_PollRadio(void)
+{
+    if (!rx_active) return;
+
+    if (deca_port_select_device(DW_RX_LISTEN_DEV) != DWT_SUCCESS) return;
+
+    uint32_t status = dwt_read32bitreg(SYS_STATUS_ID);
+
+    if (status & SYS_STATUS_RXFCG) {
+        /* Хороший кадр: снять флаг, прочитать длину/данные и метрики. */
+        dwt_write32bitreg(SYS_STATUS_ID, SYS_STATUS_RXFCG);
+
+        uint16_t frame_len = (uint16_t)(dwt_read32bitreg(RX_FINFO_ID) & RX_FINFO_RXFL_MASK_1023);
+        rx_metrics.frame_len = frame_len;
+        if (frame_len <= RX_FRAME_MAX) {
+            dwt_readrxdata(rx_frame, frame_len, 0);
+        }
+
+        dwt_readdiagnostics(&rx_metrics.diag);
+        rx_metrics.valid = 1;
+        rx_metrics.count++;
+
+        dwt_rxenable(DWT_START_RX_IMMEDIATE);   /* снова слушаем */
+    } else if (status & SYS_STATUS_ALL_RX_ERR) {
+        /* Ошибка приёма: снять флаги, сброс приёмника (реинициализация LDE). */
+        dwt_write32bitreg(SYS_STATUS_ID, SYS_STATUS_ALL_RX_ERR);
+        dwt_rxreset();
+        dwt_rxenable(DWT_START_RX_IMMEDIATE);
+    }
+    /* RX_TO не обрабатываем: таймаут не задан (непрерывный приём). */
+}
+
 /* ===========================================================================
  * РЕГИСТРАЦИЯ ОБРАБОТЧИКОВ
  * =========================================================================== */
@@ -545,9 +680,12 @@ void PROTOCOL_RegisterHandler(CommandID cmd, CommandHandler handler)
  */
 void PROTOCOL_RegisterAllHandlers(void)
 {
-    PROTOCOL_RegisterHandler(CMD_PING,           HandlePING);
-    PROTOCOL_RegisterHandler(CMD_INIT,           HandleINIT);
-    PROTOCOL_RegisterHandler(CMD_GET_STATUS,     HandleGET_STATUS);
-    PROTOCOL_RegisterHandler(CMD_SET_PHY_CONFIG, HandleSET_PHY_CONFIG);
+    PROTOCOL_RegisterHandler(CMD_PING,               HandlePING);
+    PROTOCOL_RegisterHandler(CMD_INIT,               HandleINIT);
+    PROTOCOL_RegisterHandler(CMD_GET_STATUS,         HandleGET_STATUS);
+    PROTOCOL_RegisterHandler(CMD_SET_PHY_CONFIG,     HandleSET_PHY_CONFIG);
+    PROTOCOL_RegisterHandler(CMD_RX_START,           HandleRX_START);
+    PROTOCOL_RegisterHandler(CMD_RX_STOP,            HandleRX_STOP);
+    PROTOCOL_RegisterHandler(CMD_GET_SIGNAL_METRICS, HandleGET_SIGNAL_METRICS);
     /* Остальные CMD_ID остаются NULL → STATUS_UNKNOWN_CMD. */
 }

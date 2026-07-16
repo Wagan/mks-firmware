@@ -117,7 +117,8 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
-    PROTOCOL_PollRx();   /* разбор накопленных USB-байт в thread mode */
+    PROTOCOL_PollRx();      /* разбор накопленных USB-байт в thread mode */
+    PROTOCOL_PollRadio();   /* обслуживание радиоприёма (RXFCG/ошибки) */
   }
   /* USER CODE END 3 */
 }

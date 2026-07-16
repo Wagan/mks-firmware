@@ -109,6 +109,11 @@ void PROTOCOL_RxPush(uint8_t byte);
  * Вызывается из main loop (thread mode), где HAL_Delay/deca_sleep работают. */
 void PROTOCOL_PollRx(void);
 
+/* Обслуживание радиоприёма: опрос SYS_STATUS, разбор принятого кадра/ошибок,
+ * кэширование метрик, перевключение непрерывного приёма. Вызывается из main loop
+ * (thread mode) рядом с PROTOCOL_PollRx(). Активно только после RX_START. */
+void PROTOCOL_PollRadio(void);
+
 /* Число отброшенных при переполнении rx-кольца байт (диагностика). */
 uint32_t PROTOCOL_RxOverflowCount(void);
 
