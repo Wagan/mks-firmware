@@ -24,6 +24,7 @@
 /* USER CODE BEGIN Includes */
 #include "deca_port.h"
 #include "board_config.h"
+#include "protocol.h"
 extern int bringup_read_devids(void);
 /* USER CODE END Includes */
 
@@ -102,6 +103,11 @@ int main(void)
   /* USER CODE BEGIN 2 */
   int ok = bringup_read_devids();   /* Для самого первого раза поставить точку останова здесь */
   (void)ok;                          /* смотреть g_devid[] в отладчике */
+
+  /* Слой протокола (bare-metal): парсер кормится из CDC_Receive_FS,
+   * ответы уходят через CDC_Transmit_FS. Обработчики — Шаг 2. */
+  PROTOCOL_Init();
+  PROTOCOL_RegisterAllHandlers();
   /* USER CODE END 2 */
 
   /* Infinite loop */
