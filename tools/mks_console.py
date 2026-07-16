@@ -1,0 +1,160 @@
+#!/usr/bin/env python3
+"""
+mks_console.py — интерактивная консоль для управления МКС.
+
+Удобный аналог терминала, но для БИНАРНОГО протокола: ты пишешь человеческие
+команды (ping, init, status, setphy ...), а консоль под капотом собирает кадры,
+считает CRC, шлёт и разбирает ответ. Использует mks_protocol.py.
+
+Запуск:
+    python mks_console.py COM3
+    python mks_console.py COM3 --baud 115200
+
+Команды (набирать в приглашении > ):
+    ping                      — PING
+    init                      — INIT (долгая; таймаут больше)
+    status                    — GET_STATUS (разбор 7 байт)
+    setphy <ch> <dr> <plen> <code> <prf> <pac>
+                              — SET_PHY_CONFIG
+    mode3                     — то же, что setphy 2 0 1024 9 64 32 (EVK Mode 3)
+    raw <hex...>              — послать произвольные PARAMS к произвольному CMD:
+                                raw <cmd_id> <b0> <b1> ...   (всё в hex)
+    hex                       — переключить показ ответа в hex вкл/выкл
+    help                      — список команд
+    quit / exit / q           — выход
+
+Ctrl+C прерывает текущее ожидание/выходит.
+"""
+
+import sys
+import argparse
+import mks_protocol as mks
+
+
+HELP = """\
+Доступные команды:
+  ping                                   PING -> PONG
+  init                                   INIT (инициализация DW1000, долгая)
+  status                                 GET_STATUS (разбор полей)
+  setphy <ch> <dr> <plen> <code> <prf> <pac>
+                                         SET_PHY_CONFIG (0x10)
+                                         пример: setphy 2 0 1024 9 64 32
+  mode3                                  = setphy 2 0 1024 9 64 32 (EVK Mode 3)
+  raw <cmd_id> [b0 b1 ...]               произвольная команда, всё в hex
+                                         пример: raw 00           (PING)
+                                         пример: raw 10 02 00 00 04 09 40 20
+  hex                                    вкл/выкл показ ответа в hex
+  help                                   эта справка
+  quit | exit | q                        выход
+"""
+
+
+def show_response(status, data, show_hex):
+    name = mks.status_name(status)
+    print(f"  STATUS = 0x{status:02X} ({name})")
+    if show_hex or not data:
+        dump = " ".join(f"{x:02X}" for x in data) if data else "(пусто)"
+        print(f"  DATA   = {dump}")
+
+
+def cmd_status(dev, show_hex):
+    st, data = dev.get_status()
+    show_response(st, data, show_hex)
+    if st == 0x00:
+        try:
+            for k, v in mks.parse_get_status(data).items():
+                print(f"    {k:16} = {v}")
+        except Exception as e:
+            print(f"    (разбор не удался: {e})")
+
+
+def cmd_setphy(dev, args, show_hex):
+    if len(args) != 6:
+        print("  использование: setphy <ch> <dr> <plen> <code> <prf> <pac>")
+        return
+    ch, dr, plen, code, prf, pac = (int(a) for a in args)
+    params = bytes([ch & 0xFF, dr & 0xFF,
+                    plen & 0xFF, (plen >> 8) & 0xFF,   # preamble_length u16 LE
+                    code & 0xFF, prf & 0xFF, pac & 0xFF])
+    st, data = dev.command(mks.CMD_SET_PHY_CONFIG, params)
+    show_response(st, data, show_hex)
+
+
+def cmd_raw(dev, args, show_hex):
+    if not args:
+        print("  использование: raw <cmd_id> [b0 b1 ...]  (всё в hex)")
+        return
+    try:
+        vals = [int(a, 16) for a in args]
+    except ValueError:
+        print("  ошибка: все значения должны быть hex (напр. 10 02 00)")
+        return
+    cmd_id, params = vals[0], bytes(vals[1:])
+    st, data = dev.command(cmd_id, params)
+    show_response(st, data, show_hex)
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Интерактивная консоль МКС")
+    ap.add_argument("port")
+    ap.add_argument("--baud", type=int, default=115200)
+    ap.add_argument("--timeout", type=float, default=3.0)
+    ap.add_argument("--init-timeout", type=float, default=20.0)
+    args = ap.parse_args()
+
+    print(f"Открываю {args.port} @ {args.baud} 8N1 ...")
+    try:
+        dev = mks.MKS(args.port, args.baud, args.timeout)
+    except Exception as e:
+        print(f"ОШИБКА открытия порта: {e}")
+        return 2
+
+    print("Готово. 'help' — список команд, 'quit' — выход.")
+    show_hex = False
+
+    with dev:
+        while True:
+            try:
+                line = input("> ").strip()
+            except (EOFError, KeyboardInterrupt):
+                print()
+                break
+            if not line:
+                continue
+            parts = line.split()
+            cmd, cargs = parts[0].lower(), parts[1:]
+
+            try:
+                if cmd in ("quit", "exit", "q"):
+                    break
+                elif cmd == "help":
+                    print(HELP)
+                elif cmd == "hex":
+                    show_hex = not show_hex
+                    print(f"  показ hex: {'вкл' if show_hex else 'выкл'}")
+                elif cmd == "ping":
+                    show_response(*dev.ping(), show_hex)
+                elif cmd == "init":
+                    print(f"  INIT... (жду до {args.init_timeout:.0f} c)")
+                    show_response(*dev.init(timeout=args.init_timeout), show_hex)
+                elif cmd == "status":
+                    cmd_status(dev, show_hex)
+                elif cmd == "setphy":
+                    cmd_setphy(dev, cargs, show_hex)
+                elif cmd == "mode3":
+                    cmd_setphy(dev, ["2", "0", "1024", "9", "64", "32"], show_hex)
+                elif cmd == "raw":
+                    cmd_raw(dev, cargs, show_hex)
+                else:
+                    print(f"  неизвестная команда: {cmd} (help — список)")
+            except KeyboardInterrupt:
+                print("\n  (прервано)")
+            except Exception as e:
+                print(f"  ОШИБКА: {e}")
+
+    print("Выход.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
