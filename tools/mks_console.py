@@ -19,7 +19,7 @@ mks_console.py — интерактивная консоль для управл
     mode3                     — то же, что setphy 2 0 1024 9 64 32 (EVK Mode 3)
     rxstart                   — RX_START (включить непрерывный приём)
     rxstop                    — RX_STOP  (выключить приём)
-    metrics                   — GET_SIGNAL_METRICS (интерим: сырые поля)
+    metrics [prf]             — GET_SIGNAL_METRICS: сырьё + приближ. RSSI/FP_POWER
     raw <hex...>              — послать произвольные PARAMS к произвольному CMD:
                                 raw <cmd_id> <b0> <b1> ...   (всё в hex)
     hex                       — переключить показ ответа в hex вкл/выкл
@@ -45,7 +45,9 @@ HELP = """\
   mode3                                  = setphy 2 0 1024 9 64 32 (EVK Mode 3)
   rxstart                                RX_START (0x30) — включить приём
   rxstop                                 RX_STOP  (0x31) — выключить приём
-  metrics                                GET_SIGNAL_METRICS (0x40), интерим-сырьё
+  metrics [prf]                          GET_SIGNAL_METRICS (0x40): сырьё +
+                                         приближ. RSSI/FP_POWER (dBm, UM §4.7).
+                                         prf = 16 или 64 (по умолч. 64, Mode 3)
   raw <cmd_id> [b0 b1 ...]               произвольная команда, всё в hex
                                          пример: raw 00           (PING)
                                          пример: raw 10 02 00 00 04 09 40 20
@@ -86,7 +88,15 @@ def cmd_setphy(dev, args, show_hex):
     show_response(st, data, show_hex)
 
 
-def cmd_metrics(dev, show_hex):
+def cmd_metrics(dev, args, show_hex):
+    # опциональный аргумент: PRF в МГц (16/64), по умолчанию 64 (Mode 3)
+    prf = 64
+    if args:
+        try:
+            prf = int(args[0])
+        except ValueError:
+            print("  использование: metrics [prf]   (prf = 16 или 64, по умолч. 64)")
+            return
     st, data = dev.get_signal_metrics()
     show_response(st, data, show_hex)
     if st == 0x00:
@@ -97,6 +107,14 @@ def cmd_metrics(dev, show_hex):
             verdict = "ПРИЁМ ПОДТВЕРЖДЁН" if mks.signal_metrics_ok(m) \
                 else "поля нулевые — содержательный приём под вопросом"
             print(f"    -> {verdict}")
+            # приближённая оценка мощности (UM §4.7), N без SFD-коррекции
+            try:
+                p = mks.estimate_power(m, prf_mhz=prf)
+                print(f"    RX_LEVEL   = {p['rx_level_dbm']:7.2f} dBm  (PRF {prf}М, приближ.)")
+                print(f"    FP_POWER   = {p['fp_power_dbm']:7.2f} dBm")
+                print(f"    diff       = {p['diff_db']:7.2f} dB  -> {p['channel']}")
+            except Exception as e:
+                print(f"    (оценка мощности не удалась: {e})")
         except Exception as e:
             print(f"    (разбор не удался: {e})")
     elif st == 0x06:  # TIMEOUT
@@ -171,7 +189,7 @@ def main():
                 elif cmd == "rxstop":
                     show_response(*dev.rx_stop(), show_hex)
                 elif cmd == "metrics":
-                    cmd_metrics(dev, show_hex)
+                    cmd_metrics(dev, cargs, show_hex)
                 elif cmd == "raw":
                     cmd_raw(dev, cargs, show_hex)
                 else:

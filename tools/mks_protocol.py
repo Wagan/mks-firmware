@@ -223,3 +223,69 @@ def signal_metrics_ok(m: dict) -> bool:
         and m.get("RXPACC", 0) != 0
         and m.get("FP_AMPL1", 0) != 0
     )
+
+
+# --- Оценка мощности приёма (DW1000 UM §4.7) ---------------------------------
+# Формулы дословно из UM (стр. 44–45):
+#   RX_LEVEL  = 10*log10( C * 2^17 / N^2 ) - A   [dBm]   (§4.7.2)
+#   FP_POWER  = 10*log10( (F1^2+F2^2+F3^2) / N^2 ) - A  [dBm]   (§4.7.1)
+# где C = CIR_PWR, F* = FP_AMPL1..3, N = RXPACC,
+#   A = 113.77 (PRF 16 МГц) / 121.74 (PRF 64 МГц).
+#
+# ВАЖНО (ограничение интерим-формата): N по UM может требовать SFD-коррекции,
+# но только если RXPACC == RXPACC_NOSAT. RXPACC_NOSAT в интерим-формате НЕТ,
+# поэтому здесь N берётся как есть (без SFD-коррекции). Для Mode 3 (преамбула
+# 1024) замер даёт RXPACC << 1024 → счётчик насытился рано → коррекция, скорее
+# всего, не нужна, но СТРОГО это не подтверждено. Значит RSSI/FP_POWER здесь —
+# ПРИБЛИЖЁННЫЕ. Строгий расчёт — после добавления чтения RXPACC_NOSAT в прошивку.
+import math as _math
+
+DWT_A_PRF16 = 113.77
+DWT_A_PRF64 = 121.74
+
+
+def _a_const(prf_mhz: int) -> float:
+    """A-константа по PRF (МГц). Только 16/64 определены в UM."""
+    if prf_mhz == 16:
+        return DWT_A_PRF16
+    if prf_mhz == 64:
+        return DWT_A_PRF64
+    raise ProtocolError(f"PRF {prf_mhz} МГц: A-константа не определена (только 16/64)")
+
+
+def estimate_power(m: dict, prf_mhz: int = 64) -> dict:
+    """Приближённая оценка RX_LEVEL и FP_POWER (dBm) из сырых метрик.
+
+    prf_mhz — PRF принятого сигнала (наш Mode 3 = 64). N без SFD-коррекции
+    (см. ограничение выше). Возвращает dict с rx_level_dbm, fp_power_dbm,
+    diff_db и грубой классификацией канала LOS/NLOS (UM §4.7.1: <6 дБ LOS,
+    >10 дБ NLOS).
+    """
+    A = _a_const(prf_mhz)
+    N = m["RXPACC"]
+    if N == 0:
+        raise ProtocolError("RXPACC=0 — оценка мощности невозможна")
+    n2 = float(N) * float(N)
+
+    C = m["CIR_PWR"]
+    rx_level = 10.0 * _math.log10((C * (1 << 17)) / n2) - A
+
+    f1, f2, f3 = m["FP_AMPL1"], m["FP_AMPL2"], m["FP_AMPL3"]
+    fp_sum = float(f1) * f1 + float(f2) * f2 + float(f3) * f3
+    fp_power = 10.0 * _math.log10(fp_sum / n2) - A
+
+    diff = rx_level - fp_power
+    if diff < 6.0:
+        channel = "LOS"
+    elif diff > 10.0:
+        channel = "NLOS"
+    else:
+        channel = "gray (6..10 дБ)"
+
+    return {
+        "rx_level_dbm": rx_level,
+        "fp_power_dbm": fp_power,
+        "diff_db": diff,
+        "channel": channel,
+        "approx": True,  # без SFD-коррекции N; см. ограничение в модуле
+    }
