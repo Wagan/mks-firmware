@@ -141,10 +141,24 @@ PING→PONG, INIT→OK (оба модуля DWM1000 инициализирова
 | 0x60 | TX_SWEEP | channel_start u8, channel_end u8, power_start u8, power_end u8, preamble_length u16 |
 | 0x61 | DETECTOR_TEST | number_of_packets u16, tx_power_start u8, tx_power_end u8 |
 
-> Значения `preamble_length`, `data_rate`, `PRF`, `PAC_size` передаются как
-> «сырые» числа; прошивка транслирует их в enum DecaDriver (`DWT_PLEN_*`,
-> `DWT_BR_*`, `DWT_PRF_*`, `DWT_PAC*`) с валидацией. Невалидное значение →
-> `INVALID_PARAM`. Таблицы соответствия появятся при реализации SET_PHY_CONFIG.
+> Значения `preamble_length`, `PRF`, `PAC_size` передаются как «сырые» числа
+> (симв./МГц/симв.); прошивка транслирует их в enum DecaDriver с валидацией.
+> Невалидное значение → `INVALID_PARAM`. Таблицы трансляции:
+>
+> - **channel** (u8): допустимые `{1,2,3,4,5,7}`, пропускается как есть.
+> - **data_rate** (u8): **КОД** `{0:110 kbps, 1:850 kbps, 2:6.8 Mbps}` →
+>   `DWT_BR_110K/850K/6M8`. Именно код, а не значение в кбит/с: 850 и 6800 не
+>   помещаются в u8.
+> - **preamble_length** (u16): `64/128/256/512/1024/1536/2048/4096` → `DWT_PLEN_*`.
+> - **preamble_code** (u8): `1..24` (широкая валидация; строгая PRF-зависимая —
+>   позже). Задаёт и `txCode`, и `rxCode`.
+> - **PRF** (u8): число МГц `16/64` → `DWT_PRF_16M/64M`.
+> - **PAC_size** (u8): число символов `8/16/32/64` → `DWT_PAC8/16/32/64`.
+>
+> **nsSFD** (нестандартный SFD) протоколом не передаётся: прошивка ставит его по
+> правилу `data_rate == 110 kbps → nsSFD = 1` (иначе 0), по конвенции EVK/DecaWave.
+> `sfdTO` на первом этапе = 0 → драйверный дефолт `DWT_SFDTOC_DEF`. `phrMode` =
+> `DWT_PHRMODE_STD`.
 
 ---
 

@@ -399,6 +399,134 @@ static ResponseStatus HandleGET_STATUS(const uint8_t* params, uint8_t params_len
     return STATUS_OK;
 }
 
+/* ---------------------------------------------------------------------------
+ * Трансляция wire→enum DecaDriver. Значения строго из deca_device_api.h
+ * (не хардкодить по памяти). Возврат false → значение вне таблицы → INVALID_PARAM.
+ * --------------------------------------------------------------------------- */
+
+/* channel: допустимые {1,2,3,4,5,7} (см. dwt_config_t.chan). Пропуск как есть. */
+static bool map_channel(uint8_t raw, uint8_t* out)
+{
+    switch (raw) {
+        case 1: case 2: case 3: case 4: case 5: case 7:
+            *out = raw; return true;
+        default:
+            return false;
+    }
+}
+
+/* data_rate: КОД {0:110k, 1:850k, 2:6.8M} → DWT_BR_* (не кбит/с — не влезает в u8). */
+static bool map_datarate(uint8_t code, uint8_t* out)
+{
+    switch (code) {
+        case 0: *out = DWT_BR_110K; return true;
+        case 1: *out = DWT_BR_850K; return true;
+        case 2: *out = DWT_BR_6M8;  return true;
+        default: return false;
+    }
+}
+
+/* preamble_length: сырое число символов → DWT_PLEN_*. */
+static bool map_plen(uint16_t raw, uint8_t* out)
+{
+    switch (raw) {
+        case 64:   *out = DWT_PLEN_64;   return true;
+        case 128:  *out = DWT_PLEN_128;  return true;
+        case 256:  *out = DWT_PLEN_256;  return true;
+        case 512:  *out = DWT_PLEN_512;  return true;
+        case 1024: *out = DWT_PLEN_1024; return true;
+        case 1536: *out = DWT_PLEN_1536; return true;
+        case 2048: *out = DWT_PLEN_2048; return true;
+        case 4096: *out = DWT_PLEN_4096; return true;
+        default: return false;
+    }
+}
+
+/* PRF: число МГц (16/64) → DWT_PRF_*. */
+static bool map_prf(uint8_t mhz, uint8_t* out)
+{
+    switch (mhz) {
+        case 16: *out = DWT_PRF_16M; return true;
+        case 64: *out = DWT_PRF_64M; return true;
+        default: return false;
+    }
+}
+
+/* PAC_size: число символов (8/16/32/64) → DWT_PAC*. Берём КАК ЕСТЬ из параметра
+ * (для точного повтора конфига EVK — Mode 3 вещает с PAC 32, не подменяем на 64). */
+static bool map_pac(uint8_t symbols, uint8_t* out)
+{
+    switch (symbols) {
+        case 8:  *out = DWT_PAC8;  return true;
+        case 16: *out = DWT_PAC16; return true;
+        case 32: *out = DWT_PAC32; return true;
+        case 64: *out = DWT_PAC64; return true;
+        default: return false;
+    }
+}
+
+/**
+ * @brief SET_PHY_CONFIG (0x10). Настройка PHY DW1000 (dwt_configure).
+ *        Параметры (wire, §6, БЕЗ target, 7 байт): channel u8, data_rate u8,
+ *        preamble_length u16 LE, preamble_code u8, PRF u8, PAC_size u8.
+ *        Трансляция wire→enum с валидацией (невалидное → INVALID_PARAM).
+ *        Применяется на ВСЕ модули. dwt_configure содержит deca_sleep → handler
+ *        исполняется в main loop (PollRx), SPI держим медленным (LDE-загрузка).
+ *        ТРЕБУЕТ ПРЕДВАРИТЕЛЬНОГО INIT: dwt_configure опирается на состояние,
+ *        установленное dwt_initialise; если модуль не инициализирован — команда
+ *        возвращает RADIO_ERROR. Правильный порядок: INIT → SET_PHY_CONFIG.
+ */
+static ResponseStatus HandleSET_PHY_CONFIG(const uint8_t* params, uint8_t params_len,
+                                           uint8_t** out_data, uint8_t* out_len)
+{
+    (void)out_data;
+    *out_len = 0;
+
+    if (params_len < 7) return STATUS_INVALID_PARAM;
+
+    uint8_t  channel   = params[0];
+    uint8_t  data_rate = params[1];
+    uint16_t plen_raw  = GET_U16LE(&params[2]);
+    uint8_t  pcode     = params[4];
+    uint8_t  prf_raw   = params[5];
+    uint8_t  pac_raw   = params[6];
+
+    dwt_config_t cfg;
+    if (!map_channel(channel, &cfg.chan))         return STATUS_INVALID_PARAM;
+    if (!map_datarate(data_rate, &cfg.dataRate))  return STATUS_INVALID_PARAM;
+    if (!map_plen(plen_raw, &cfg.txPreambLength)) return STATUS_INVALID_PARAM;
+    if (!map_prf(prf_raw, &cfg.prf))              return STATUS_INVALID_PARAM;
+    if (!map_pac(pac_raw, &cfg.rxPAC))            return STATUS_INVALID_PARAM;
+
+    /* preamble_code: временно ШИРОКАЯ валидация 1..24 (общий диапазон DW1000).
+     * Строгую PRF-зависимую (PRF16:1..8 / PRF64:9..24) сделаем позже. */
+    if (pcode < 1 || pcode > 24) return STATUS_INVALID_PARAM;
+    cfg.txCode = pcode;
+    cfg.rxCode = pcode;
+
+    /* nsSFD по правилу data_rate: 110k → нестандартный SFD (конвенция EVK).
+     * Протокол признак SFD не передаёт (согласовано). */
+    cfg.nsSFD   = (cfg.dataRate == DWT_BR_110K) ? 1 : 0;
+    cfg.phrMode = DWT_PHRMODE_STD;
+    cfg.sfdTO   = 0;   /* 0 → драйвер подставит DWT_SFDTOC_DEF (deca_device.c) */
+
+    /* Применяем на все модули. Требуется предварительный INIT (dwt_configure
+     * опирается на состояние, установленное dwt_initialise). */
+    for (int i = 0; i < DW_DEVICE_COUNT; i++) {
+        if (!dw_dev_state[i].initialized) return STATUS_RADIO_ERROR;
+
+        if (deca_port_select_device(i) != DWT_SUCCESS) return STATUS_RADIO_ERROR;
+        dwt_configure(&cfg);   /* void: валидация уже сделана ДО вызова */
+
+        dw_dev_state[i].channel      = channel;
+        dw_dev_state[i].data_rate    = data_rate;
+        dw_dev_state[i].preamble_len = plen_raw;
+        dw_dev_state[i].prf          = prf_raw;
+    }
+
+    return STATUS_OK;
+}
+
 /* ===========================================================================
  * РЕГИСТРАЦИЯ ОБРАБОТЧИКОВ
  * =========================================================================== */
@@ -410,19 +538,16 @@ void PROTOCOL_RegisterHandler(CommandID cmd, CommandHandler handler)
 /**
  * @brief Регистрация обработчиков команд API.
  *
- * Шаг 1 (текущий, bare-metal): обработчики не зарегистрированы — на любую
- * команду ядро отвечает STATUS_UNKNOWN_CMD. Это уже проверяет сквозной тракт
- * USB CDC → парсер → CRC → построитель ответа.
- *
- * Шаг 2 (текущий): зарегистрированы PING / INIT / GET_STATUS (синхронно, поверх
- * DecaDriver через deca_port). Остальные 14 команд НЕ регистрируются —
- * диспетчер на них отвечает STATUS_UNKNOWN_CMD (заглушка). TX/RX/диагностика/
- * эксперименты — позже, вместе с radio_manager и FreeRTOS.
+ * Зарегистрированы (синхронно, поверх DecaDriver через deca_port, исполнение
+ * в main loop): PING / INIT / GET_STATUS / SET_PHY_CONFIG. Остальные команды НЕ
+ * регистрируются — диспетчер на них отвечает STATUS_UNKNOWN_CMD (заглушка).
+ * TX/RX/диагностика/эксперименты — позже, вместе с radio_manager и FreeRTOS.
  */
 void PROTOCOL_RegisterAllHandlers(void)
 {
-    PROTOCOL_RegisterHandler(CMD_PING,       HandlePING);
-    PROTOCOL_RegisterHandler(CMD_INIT,       HandleINIT);
-    PROTOCOL_RegisterHandler(CMD_GET_STATUS, HandleGET_STATUS);
+    PROTOCOL_RegisterHandler(CMD_PING,           HandlePING);
+    PROTOCOL_RegisterHandler(CMD_INIT,           HandleINIT);
+    PROTOCOL_RegisterHandler(CMD_GET_STATUS,     HandleGET_STATUS);
+    PROTOCOL_RegisterHandler(CMD_SET_PHY_CONFIG, HandleSET_PHY_CONFIG);
     /* Остальные CMD_ID остаются NULL → STATUS_UNKNOWN_CMD. */
 }
