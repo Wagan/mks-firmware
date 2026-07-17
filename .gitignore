@@ -29,6 +29,7 @@ Thumbs.db
 /docs/reference/tx_planning_sources.zip
 /docs/reference/recon_txperiodic.txt
 /docs/reference/txperiodic_src.zip
+/tools/recon_settxpower.txt
 
 # --- Keep these (do NOT ignore): ---
 # .project, .cproject, *.ioc, *.ld  -- эти файлы коммитим
