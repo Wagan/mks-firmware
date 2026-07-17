@@ -622,6 +622,67 @@ static ResponseStatus HandleGET_SIGNAL_METRICS(const uint8_t* params, uint8_t pa
     return STATUS_OK;
 }
 
+/* Лимиты TX (см. PLAN_tx_tract §9.6). TX_FRAME_MAX — макс. payload (127 макс.
+ * стандартный кадр − 2 байта авто-FCS). TX_WAIT_GUARD — потолок busy-wait TXFRS
+ * (кадр Mode3 ~сотни мкс; счётчик защищает от вечного цикла). */
+#define TX_FRAME_MAX    125
+#define TX_WAIT_GUARD   100000u
+
+/**
+ * @brief TX_FRAME (0x20). Передать одиночный кадр с модуля DW_TX_SOURCE_DEV.
+ *        Параметры (wire, §6): length u16 LE, payload[length].
+ *        DW1000 сам дописывает 2-байтный FCS → в драйвер передаём length+2
+ *        (dwt_writetxdata копирует len−2 = length байт payload). Требует INIT.
+ *        Ждём TXFRS (кадр ушёл) с guard-счётчиком. DATA нет; OK при TXFRS.
+ */
+static ResponseStatus HandleTX_FRAME(const uint8_t* params, uint8_t params_len,
+                                     uint8_t** out_data, uint8_t* out_len)
+{
+    (void)out_data;
+    *out_len = 0;
+
+    if (params_len < 2) return STATUS_INVALID_PARAM;          /* нет поля length */
+    uint16_t length = GET_U16LE(&params[0]);
+    if (params_len < 2 + length) return STATUS_INVALID_PARAM; /* payload короче заявленного */
+    if (length > TX_FRAME_MAX)   return STATUS_BUFFER_OVERFLOW;
+
+    if (!dw_dev_state[DW_TX_SOURCE_DEV].initialized) return STATUS_RADIO_ERROR;
+    if (deca_port_select_device(DW_TX_SOURCE_DEV) != DWT_SUCCESS) return STATUS_RADIO_ERROR;
+
+    dwt_write32bitreg(SYS_STATUS_ID, SYS_STATUS_TXFRS);       /* очистить флаг завершения TX */
+
+    /* length+2: место под авто-FCS; dwt_writetxdata запишет length байт payload. */
+    if (dwt_writetxdata((uint16_t)(length + 2), (uint8_t*)&params[2], 0) != DWT_SUCCESS)
+        return STATUS_RADIO_ERROR;
+    dwt_writetxfctrl((uint16_t)(length + 2), 0, 0);           /* ranging=0 (обычный data-кадр) */
+
+    if (dwt_starttx(DWT_START_TX_IMMEDIATE) != DWT_SUCCESS)
+        return STATUS_RADIO_ERROR;
+
+    /* Ждём TXFRS (кадр ушёл в эфир) с ограничением — защита от вечного цикла. */
+    uint32_t guard = TX_WAIT_GUARD;
+    while (!(dwt_read32bitreg(SYS_STATUS_ID) & SYS_STATUS_TXFRS)) {
+        if (--guard == 0) return STATUS_TIMEOUT;              /* кадр не ушёл */
+    }
+    dwt_write32bitreg(SYS_STATUS_ID, SYS_STATUS_TXFRS);      /* снять флаг */
+
+    return STATUS_OK;
+}
+
+/**
+ * @brief TX_STOP (0x22). Перевести передатчик в IDLE (dwt_forcetrxoff).
+ */
+static ResponseStatus HandleTX_STOP(const uint8_t* params, uint8_t params_len,
+                                    uint8_t** out_data, uint8_t* out_len)
+{
+    (void)params; (void)params_len; (void)out_data;
+    *out_len = 0;
+
+    if (deca_port_select_device(DW_TX_SOURCE_DEV) != DWT_SUCCESS) return STATUS_RADIO_ERROR;
+    dwt_forcetrxoff();
+    return STATUS_OK;
+}
+
 /* ===========================================================================
  * ОБСЛУЖИВАНИЕ ПРИЁМА (main loop) — polling SYS_STATUS
  * ===========================================================================
@@ -687,5 +748,7 @@ void PROTOCOL_RegisterAllHandlers(void)
     PROTOCOL_RegisterHandler(CMD_RX_START,           HandleRX_START);
     PROTOCOL_RegisterHandler(CMD_RX_STOP,            HandleRX_STOP);
     PROTOCOL_RegisterHandler(CMD_GET_SIGNAL_METRICS, HandleGET_SIGNAL_METRICS);
+    PROTOCOL_RegisterHandler(CMD_TX_FRAME,           HandleTX_FRAME);
+    PROTOCOL_RegisterHandler(CMD_TX_STOP,            HandleTX_STOP);
     /* Остальные CMD_ID остаются NULL → STATUS_UNKNOWN_CMD. */
 }

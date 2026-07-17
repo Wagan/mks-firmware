@@ -41,6 +41,10 @@
  * M2; если сигнал EVK не слышно — поменять на DW_DEV_M1 (одна строка). */
 #define DW_RX_LISTEN_DEV            DW_DEV_M2
 
+/* Модуль-источник для TX_FRAME/TX_STOP. Предположительно Источник = M1; для
+ * loopback M1(TX)→M2(RX). Если loopback не пойдёт — поменять строку. */
+#define DW_TX_SOURCE_DEV            DW_DEV_M1
+
 /* --- Полярность сброса (RST через BSS138). OQ-9: проверить на железе. ---
  * Гипотеза: лог.1 на пине МК -> MOSFET открыт -> RSTn к земле -> сброс актив.
  * Если окажется наоборот — поменять на 0 (одно место). */
@@ -82,6 +86,7 @@
 
 #define DW_DEV_M1                   0
 #define DW_RX_LISTEN_DEV            DW_DEV_M1   /* единственный модуль */
+#define DW_TX_SOURCE_DEV            DW_DEV_M1   /* единственный модуль */
 
 #define DW_RST_ACTIVE_HIGH          1   /* прямое подключение, уточнить */
 
