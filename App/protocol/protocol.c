@@ -20,6 +20,7 @@
 #include "deca_regs.h"       /* SYS_STATUS_ID/RXFCG/ALL_RX_ERR, RX_FINFO_ID, маски */
 #include "board_config.h"    /* DW_DEVICE_COUNT, DW_RX_LISTEN_DEV */
 #include <string.h>
+#include <math.h>            /* log10f, lrintf — строгий RSSI/FP_POWER (UM §4.7) */
 
 /* ===========================================================================
  * КОНСТАНТЫ И МАКРОСЫ ПРОТОКОЛА
@@ -177,6 +178,7 @@ static struct {
     uint16_t     count;      /* число принятых хороших кадров (для отладки) */
     uint16_t     frame_len;  /* длина последнего кадра */
     dwt_rxdiag_t diag;       /* сырые метрики последнего кадра (dwt_readdiagnostics) */
+    uint16_t     rxpacc_nosat; /* RXPACC_NOSAT последнего кадра (DRX_CONF 0x2C) */
 } rx_metrics;
 
 static uint8_t rx_frame[RX_FRAME_MAX];  /* последний принятый кадр */
@@ -211,6 +213,7 @@ void PROTOCOL_Init(void)
     rx_active         = 0;
     rx_metrics.valid  = 0;
     rx_metrics.count  = 0;
+    rx_metrics.rxpacc_nosat = 0;
 
     tx_periodic_active = 0;
     tx_periodic_count  = 0;
@@ -626,11 +629,63 @@ static ResponseStatus HandleRX_STOP(const uint8_t* params, uint8_t params_len,
     return STATUS_OK;
 }
 
+/* RXPACC_NOSAT: DRX_CONF (0x27), sub-offset 0x2C, 2 байта RO (UM §7.2.40.12).
+ * Не-насыщаемый счётчик символов преамбулы — для проверки, нужна ли SFD-коррекция
+ * RXPACC (UM стр. 96). В vendor deca_regs.h не определён; DRX_CONF_ID=0x27 есть. */
+#define RXPACC_NOSAT_OFFSET   0x2C
+
+/* SFD-коррекция RXPACC для нашего Mode 3 (110 kbps, nsSFD=1 → DecaWave-defined
+ * 64-symbol SFD): −82 (UM Table 18, стр. 97). Применяется ТОЛЬКО когда
+ * RXPACC == RXPACC_NOSAT (UM стр. 96); для наших замеров (RXPACC≠NOSAT) ветка не
+ * срабатывает — значение защитное, но заложено документально. */
+#define SFD_CORRECTION_MODE3  82
+
+/* A-константа по PRF (raw wire), UM §4.7. */
+static float metrics_a_const(uint8_t prf_wire)
+{
+    return (prf_wire == 64) ? 121.74f : 113.77f;
+}
+
+/* N (число символов преамбулы) с SFD-коррекцией по UM стр. 96. */
+static uint16_t metrics_corrected_n(const dwt_rxdiag_t* d, uint16_t nosat)
+{
+    uint16_t rxpacc = d->rxPreamCount;
+    if (rxpacc == nosat) {                       /* коррекция нужна */
+        return (rxpacc > SFD_CORRECTION_MODE3)
+             ? (uint16_t)(rxpacc - SFD_CORRECTION_MODE3)
+             : rxpacc;                           /* защита от ухода в 0/underflow */
+    }
+    return rxpacc;                               /* коррекция не нужна */
+}
+
+/* RSSI (RX_LEVEL) в dBm×100. Крайние случаи (N=0 или C=0) → INT16_MIN («н/д»). */
+static int16_t metrics_rssi_q(const dwt_rxdiag_t* d, uint16_t N, float A)
+{
+    if (N == 0 || d->maxGrowthCIR == 0) return INT16_MIN;
+    float n2 = (float)N * (float)N;
+    float v  = 10.0f * log10f(((float)d->maxGrowthCIR * 131072.0f) / n2) - A;
+    return (int16_t)lrintf(v * 100.0f);
+}
+
+/* FP_POWER в dBm×100. Крайние случаи (N=0 или сумма амплитуд=0) → INT16_MIN. */
+static int16_t metrics_fp_q(const dwt_rxdiag_t* d, uint16_t N, float A)
+{
+    if (N == 0) return INT16_MIN;
+    float f1=(float)d->firstPathAmp1, f2=(float)d->firstPathAmp2, f3=(float)d->firstPathAmp3;
+    float fp_sum = f1*f1 + f2*f2 + f3*f3;
+    if (fp_sum == 0.0f) return INT16_MIN;
+    float n2 = (float)N * (float)N;
+    float v  = 10.0f * log10f(fp_sum / n2) - A;
+    return (int16_t)lrintf(v * 100.0f);
+}
+
 /**
- * @brief GET_SIGNAL_METRICS (0x40). Отдать сырые метрики последнего кадра
- *        (dwt_rxdiag_t). ИНТЕРИМ-формат (18 байт, u16 LE): count, maxGrowthCIR,
- *        rxPreamCount, stdNoise, firstPathAmp1, firstPathAmp2, firstPathAmp3,
- *        firstPath, maxNoise. Заменится на RSSI/SNR по формулам UM §4.7.
+ * @brief GET_SIGNAL_METRICS (0x40). Метрики последнего принятого кадра.
+ *        Формат — 28 байт, u16 LE. Первые 18 байт (совместимость): count,
+ *        maxGrowthCIR, rxPreamCount, stdNoise, firstPathAmp1..3, firstPath,
+ *        maxNoise. Далее СТРОГИЕ поля (UM §4.7): RXPACC_NOSAT, N_corrected,
+ *        RSSI (i16 dBm×100), FP_POWER (i16 dBm×100), A_used×100. RSSI/FP_POWER
+ *        считаются в прошивке на float; N/д → INT16_MIN. SNR — отдельный заход.
  *        Если кадра ещё не было (valid==0) → TIMEOUT.
  */
 static ResponseStatus HandleGET_SIGNAL_METRICS(const uint8_t* params, uint8_t params_len,
@@ -640,10 +695,11 @@ static ResponseStatus HandleGET_SIGNAL_METRICS(const uint8_t* params, uint8_t pa
 
     if (!rx_metrics.valid) return STATUS_TIMEOUT;   /* кадра ещё не принято */
 
-    static uint8_t data[18];
+    static uint8_t data[28];
     const dwt_rxdiag_t* d = &rx_metrics.diag;
     uint8_t* p = data;
 
+    /* Первые 18 байт — интерим-совместимость (не менять порядок). */
     PUT_U16LE(p, rx_metrics.count); p += 2;
     PUT_U16LE(p, d->maxGrowthCIR);  p += 2;
     PUT_U16LE(p, d->rxPreamCount);  p += 2;
@@ -654,8 +710,22 @@ static ResponseStatus HandleGET_SIGNAL_METRICS(const uint8_t* params, uint8_t pa
     PUT_U16LE(p, d->firstPath);     p += 2;
     PUT_U16LE(p, d->maxNoise);      p += 2;
 
+    /* Строгие поля (UM §4.7), дописаны в конец. */
+    uint8_t  prf_wire = dw_dev_state[DW_RX_LISTEN_DEV].prf;
+    float    A        = metrics_a_const(prf_wire);
+    uint16_t N        = metrics_corrected_n(d, rx_metrics.rxpacc_nosat);
+    int16_t  rssi_q   = metrics_rssi_q(d, N, A);
+    int16_t  fp_q     = metrics_fp_q(d, N, A);
+    uint16_t a_q      = (uint16_t)lrintf(A * 100.0f);
+
+    PUT_U16LE(p, rx_metrics.rxpacc_nosat); p += 2;
+    PUT_U16LE(p, N);                       p += 2;
+    PUT_U16LE(p, (uint16_t)rssi_q);        p += 2;   /* i16 в u16-контейнер, LE */
+    PUT_U16LE(p, (uint16_t)fp_q);          p += 2;
+    PUT_U16LE(p, a_q);                     p += 2;
+
     *out_data = data;
-    *out_len  = 18;
+    *out_len  = 28;
     return STATUS_OK;
 }
 
@@ -845,6 +915,8 @@ void PROTOCOL_PollRadio(void)
         }
 
         dwt_readdiagnostics(&rx_metrics.diag);
+        /* RXPACC_NOSAT — активное устройство уже выбрано выше (DW_RX_LISTEN_DEV). */
+        rx_metrics.rxpacc_nosat = dwt_read16bitoffsetreg(DRX_CONF_ID, RXPACC_NOSAT_OFFSET);
         rx_metrics.valid = 1;
         rx_metrics.count++;
 
