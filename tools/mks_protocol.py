@@ -1,4 +1,15 @@
 """
+*******************************************************************************
+  МКС — Модуль коммуникации и сопряжения
+  Хостовые инструменты (ПК) для STM32F411 + 2x DWM1000 (DW1000)
+
+  Файл:     mks_protocol.py
+  Описание: библиотека протокола обмена ПК <-> МКС (кадры, CRC8, команды,
+            разбор метрик приёма).
+
+  Copyright (c) 2026 NCPR, Flexlab LLC. Все права защищены.
+*******************************************************************************
+
 mks_protocol.py — библиотека протокола обмена ПК <-> МКС.
 
 Источник истины: docs/PROTOCOL_SPEC.md
@@ -27,11 +38,19 @@ v4 (2026-07-17): добавлен SET_TX_POWER(0x11) — ручная регул
 (вариант A: power_level u8, БОЛЬШЕ level → БОЛЬШЕ мощность; 0≈мин, 0xDF≈макс).
 Ответ DATA = применённый регистр power (u32 LE). Требует предварительного
 SET_PHY_CONFIG. Проверено loopback M1→M2: RX_LEVEL монотонно растёт с level.
+
+v5 (2026-07-17): GET_SIGNAL_METRICS расширен 18→28→30 байт (ФИНАЛ) — прошивка
+считает строгий RSSI/FP_POWER (UM §4.7, RXPACC_NOSAT) и total SNR (= RSL + delta,
+delta из DecaRanging: 79.5 для каналов 1/2/3/5, 77.0 для 4/7).
+parse_signal_metrics поддерживает 18 (интерим) / 28 / 30 (финал) байт по длине.
 """
 
 from __future__ import annotations
 import struct
 import time
+
+# Единый источник версии хостовых инструментов (баннер консоли берёт отсюда).
+HOST_VERSION = "5"
 
 SYNC = bytes([0xAA, 0x55])
 
@@ -246,17 +265,45 @@ SIGNAL_METRICS_FIELDS = (
 
 
 def parse_signal_metrics(data: bytes) -> dict:
-    """Разобрать ИНТЕРИМ-DATA GET_SIGNAL_METRICS (18 байт, 9x u16 LE).
+    """Разобрать DATA GET_SIGNAL_METRICS. Поддержаны два формата по ДЛИНЕ:
 
-    Возвращает dict сырых полей. Формулы RSSI/SNR тут НЕ считаются —
-    это следующий шаг (UM §4.7), требующий RXPACC_NOSAT.
+    - 18 байт (ИНТЕРИМ, 9x u16 LE): только сырые поля dwt_rxdiag_t.
+    - 28 байт (ФИНАЛ): первые 18 = те же сырые поля, затем 5 полей LE —
+      RXPACC_NOSAT u16, N_corrected u16, RSSI i16 (dBm×100), FP_POWER i16
+      (dBm×100), A_used u16 (A×100). RSSI/FP_POWER посчитаны В ПРОШИВКЕ (UM §4.7)
+      с корректным N (SFD-коррекция по RXPACC==RXPACC_NOSAT).
+
+    Ключ 'format' в результате = 'interim' | 'final'. Для финала добавлены поля
+    rxpacc_nosat, N_corrected, rssi_dbm, fp_power_dbm, A_used (уже в человеческих
+    единицах: dBm и A — float).
     """
-    if len(data) != 18:
-        raise ProtocolError(
-            f"GET_SIGNAL_METRICS: ожидалось 18 байт (интерим), получено {len(data)}"
-        )
-    values = struct.unpack("<9H", data)
-    return dict(zip(SIGNAL_METRICS_FIELDS, values))
+    if len(data) == 18:
+        values = struct.unpack("<9H", data)
+        m = dict(zip(SIGNAL_METRICS_FIELDS, values))
+        m["format"] = "interim"
+        return m
+    if len(data) in (28, 30):
+        head = struct.unpack("<9H", data[:18])
+        m = dict(zip(SIGNAL_METRICS_FIELDS, head))
+        nosat, n_corr, rssi_q, fp_q, a_q = struct.unpack("<HHhhH", data[18:28])
+        m["format"]       = "final"
+        m["rxpacc_nosat"] = nosat
+        m["N_corrected"]  = n_corr
+        m["rssi_dbm"]     = rssi_q / 100.0
+        m["fp_power_dbm"] = fp_q / 100.0
+        m["A_used"]       = a_q / 100.0
+        # признак 'н/д' из прошивки (INT16_MIN = -32768 → /100 = -327.68)
+        m["rssi_valid"]   = (rssi_q != -32768)
+        m["fp_valid"]     = (fp_q   != -32768)
+        if len(data) == 30:
+            (snr_q,) = struct.unpack("<h", data[28:30])
+            m["snr_db"]    = snr_q / 100.0
+            m["snr_valid"] = (snr_q != -32768)
+        return m
+    raise ProtocolError(
+        f"GET_SIGNAL_METRICS: ожидалось 18 (интерим), 28 или 30 (финал) байт, "
+        f"получено {len(data)}"
+    )
 
 
 def signal_metrics_ok(m: dict) -> bool:

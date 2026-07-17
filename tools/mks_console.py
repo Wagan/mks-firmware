@@ -1,5 +1,16 @@
 #!/usr/bin/env python3
 """
+*******************************************************************************
+  МКС — Модуль коммуникации и сопряжения
+  Хостовые инструменты (ПК) для STM32F411 + 2x DWM1000 (DW1000)
+
+  Файл:     mks_console.py
+  Описание: интерактивная консоль управления МКС по бинарному протоколу
+            (человеческие команды -> кадры/CRC -> разбор ответа).
+
+  Copyright (c) 2026 NCPR, Flexlab LLC. Все права защищены.
+*******************************************************************************
+
 mks_console.py — интерактивная консоль для управления МКС.
 
 Удобный аналог терминала, но для БИНАРНОГО протокола: ты пишешь человеческие
@@ -123,14 +134,38 @@ def cmd_metrics(dev, args, show_hex):
             verdict = "ПРИЁМ ПОДТВЕРЖДЁН" if mks.signal_metrics_ok(m) \
                 else "поля нулевые — содержательный приём под вопросом"
             print(f"    -> {verdict}")
-            # приближённая оценка мощности (UM §4.7), N без SFD-коррекции
-            try:
-                p = mks.estimate_power(m, prf_mhz=prf)
-                print(f"    RX_LEVEL   = {p['rx_level_dbm']:7.2f} dBm  (PRF {prf}М, приближ.)")
-                print(f"    FP_POWER   = {p['fp_power_dbm']:7.2f} dBm")
-                print(f"    diff       = {p['diff_db']:7.2f} dB  -> {p['channel']}")
-            except Exception as e:
-                print(f"    (оценка мощности не удалась: {e})")
+
+            # ФИНАЛЬНЫЙ формат (28/30 байт): строгий расчёт ИЗ ПРОШИВКИ (UM §4.7)
+            if m.get("format") == "final":
+                print(f"    --- строгий расчёт в прошивке (UM §4.7) ---")
+                print(f"    RXPACC_NOSAT = {m['rxpacc_nosat']}  "
+                      f"(RXPACC={m['RXPACC']}: "
+                      f"{'РАВНЫ → SFD-коррекция' if m['rxpacc_nosat']==m['RXPACC'] else 'не равны → коррекция не нужна'})")
+                print(f"    N_corrected  = {m['N_corrected']}")
+                if m["rssi_valid"]:
+                    print(f"    RSSI(fw)     = {m['rssi_dbm']:7.2f} dBm  (A={m['A_used']:.2f})")
+                else:
+                    print(f"    RSSI(fw)     = н/д (N=0 или CIR_PWR=0)")
+                if m["fp_valid"]:
+                    print(f"    FP_POWER(fw) = {m['fp_power_dbm']:7.2f} dBm")
+                else:
+                    print(f"    FP_POWER(fw) = н/д")
+                # SNR (только в 30-байтовом формате): SNR = RSL + delta (DecaRanging)
+                if "snr_db" in m:
+                    if m["snr_valid"]:
+                        print(f"    SNR(fw)      = {m['snr_db']:7.2f} dB   (= RSL + delta)")
+                    else:
+                        print(f"    SNR(fw)      = н/д")
+            else:
+                # ИНТЕРИМ-формат (18 байт): строгого расчёта в прошивке нет —
+                # даём приближённую хостовую оценку (fallback для старой прошивки)
+                try:
+                    p = mks.estimate_power(m, prf_mhz=prf)
+                    print(f"    RX_LEVEL   = {p['rx_level_dbm']:7.2f} dBm  (PRF {prf}М, приближ., хост)")
+                    print(f"    FP_POWER   = {p['fp_power_dbm']:7.2f} dBm")
+                    print(f"    diff       = {p['diff_db']:7.2f} dB  -> {p['channel']}")
+                except Exception as e:
+                    print(f"    (оценка мощности не удалась: {e})")
         except Exception as e:
             print(f"    (разбор не удался: {e})")
     elif st == 0x06:  # TIMEOUT
@@ -221,6 +256,13 @@ def main():
     ap.add_argument("--timeout", type=float, default=3.0)
     ap.add_argument("--init-timeout", type=float, default=20.0)
     args = ap.parse_args()
+
+    # Баннер при запуске: что это, версия (из mks_protocol.HOST_VERSION), копирайт.
+    print("=" * 60)
+    print("  МКС — консоль управления (ПК)")
+    print(f"  Версия хостовых инструментов: v{mks.HOST_VERSION}")
+    print("  (c) 2026 NCPR, Flexlab LLC")
+    print("=" * 60)
 
     print(f"Открываю {args.port} @ {args.baud} 8N1 ...")
     try:
