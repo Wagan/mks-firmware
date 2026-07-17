@@ -27,6 +27,8 @@ Thumbs.db
 # --- Локальные планировочные артефакты (держим на диске, НЕ коммитим) ---
 /docs/reference/recon.txt
 /docs/reference/tx_planning_sources.zip
+/docs/reference/recon_txperiodic.txt
+/docs/reference/txperiodic_src.zip
 
 # --- Keep these (do NOT ignore): ---
 # .project, .cproject, *.ioc, *.ld  -- эти файлы коммитим
