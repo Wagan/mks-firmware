@@ -197,6 +197,22 @@ static uint32_t  tx_periodic_count;           /* послано кадров (д
 static uint8_t   tx_power_level;   /* последний применённый power_level (0 = не задан) */
 static uint32_t  tx_power_reg;     /* последнее записанное значение регистра power */
 
+/* Снимок окна CIR вокруг first path. Захватывается в ветке RXFCG ДО rxenable
+ * (accumulator валиден только пока приёмник не перевзведён — NOTES §5).
+ * Хранит сырые байты среза БЕЗ dummy: cir_snap.count отсчётов × 4 байта.
+ * Порядок на проводе — как в accumulator: I(int16 LE), Q(int16 LE) на отсчёт. */
+#define CIR_HALF_MAX    31u                     /* макс. полуширина окна снимка */
+#define CIR_SNAP_MAXCNT (2u*CIR_HALF_MAX + 1u)  /* 63 отсчёта */
+#define CIR_SNAP_BYTES  (CIR_SNAP_MAXCNT * 4u)  /* 252 байта данных окна */
+
+static struct {
+    uint8_t  valid;                 /* снимок сделан после последнего RX_START */
+    uint16_t fp_index;              /* индекс first path (firstPath>>6) */
+    uint16_t start_index;           /* индекс первого отсчёта окна в accumulator */
+    uint16_t count;                 /* число отсчётов в снимке */
+    uint8_t  data[CIR_SNAP_BYTES];  /* I/Q без dummy: count*4 байт */
+} cir_snap;
+
 /* ===========================================================================
  * ПАРСЕР ВХОДЯЩИХ БАЙТОВ
  * =========================================================================== */
@@ -220,6 +236,8 @@ void PROTOCOL_Init(void)
 
     tx_power_level = 0;
     tx_power_reg   = 0;
+
+    cir_snap.valid = 0;
 }
 
 void PROTOCOL_ProcessByte(uint8_t byte)
@@ -761,6 +779,60 @@ static ResponseStatus HandleGET_SIGNAL_METRICS(const uint8_t* params, uint8_t pa
     return STATUS_OK;
 }
 
+/* Верхняя граница полуширины ОКНА в ответе GET_CIR: 6-байтный заголовок + count*4
+ * данных должно уместиться в 255 (LEN — 1 байт). count<=62 → half<=30 (61 отсчёт,
+ * 250 байт). Дефолт half=16 (33 отсчёта, 138 байт). */
+#define CIR_RESP_HALF_MAX   30u
+#define CIR_RESP_HALF_DEF   16u
+
+/**
+ * @brief GET_CIR (0x41). Отдать окно CIR вокруг first path из снимка cir_snap.
+ *        Параметр (wire): half u8 — полуширина окна (0 → дефолт CIR_RESP_HALF_DEF,
+ *        клампится к CIR_RESP_HALF_MAX). Центр окна — first path (выбирает прошивка).
+ *        Ответ DATA: fp_index u16 LE, start_index u16 LE, count u16 LE, затем
+ *        count пар I/Q (int16 LE каждая). Если снимка нет (не было приёма после
+ *        RX_START) → TIMEOUT. Снимок делается в PollRadio (ветка RXFCG) до rxenable.
+ */
+static ResponseStatus HandleGET_CIR(const uint8_t* params, uint8_t params_len,
+                                    uint8_t** out_data, uint8_t* out_len)
+{
+    *out_len = 0;
+
+    if (!cir_snap.valid) return STATUS_TIMEOUT;   /* кадра/снимка ещё не было */
+
+    /* Полуширина из запроса. */
+    uint16_t half = CIR_RESP_HALF_DEF;
+    if (params_len >= 1 && params[0] != 0) half = params[0];
+    if (half > CIR_RESP_HALF_MAX) half = CIR_RESP_HALF_MAX;
+
+    /* Окно отдачи центрируем на fp_index снимка, не выходя за границы снимка
+     * [start_index .. start_index+count-1]. Индексы — в домене accumulator. */
+    uint16_t fp    = cir_snap.fp_index;
+    uint16_t s_beg = cir_snap.start_index;
+    uint16_t s_end = (uint16_t)(cir_snap.start_index + cir_snap.count - 1u);
+
+    uint16_t out_beg = (fp > half) ? (uint16_t)(fp - half) : 0u;
+    uint16_t out_end = (uint16_t)(fp + half);
+    if (out_beg < s_beg) out_beg = s_beg;
+    if (out_end > s_end) out_end = s_end;
+    uint16_t out_cnt = (uint16_t)(out_end - out_beg + 1u);
+
+    /* Смещение начала окна отдачи внутри cir_snap.data (в отсчётах). */
+    uint16_t off_samples = (uint16_t)(out_beg - s_beg);
+
+    static uint8_t data[6 + CIR_RESP_HALF_MAX*2*4 + 4];  /* заголовок + макс. тело */
+    uint8_t* p = data;
+    PUT_U16LE(p, fp);       p += 2;
+    PUT_U16LE(p, out_beg);  p += 2;
+    PUT_U16LE(p, out_cnt);  p += 2;
+    memcpy(p, &cir_snap.data[off_samples * 4u], (size_t)(out_cnt * 4u));
+    p += out_cnt * 4u;
+
+    *out_data = data;
+    *out_len  = (uint8_t)(p - data);   /* <= 250, помещается в u8 LEN */
+    return STATUS_OK;
+}
+
 /* Лимиты TX (см. PLAN_tx_tract §9.6). TX_FRAME_MAX — макс. payload (127 макс.
  * стандартный кадр − 2 байта авто-FCS). TX_WAIT_GUARD — потолок busy-wait TXFRS
  * (кадр Mode3 ~сотни мкс; счётчик защищает от вечного цикла). */
@@ -920,6 +992,44 @@ static ResponseStatus HandleSET_TX_POWER(const uint8_t* params, uint8_t params_l
     return STATUS_OK;
 }
 
+/* Снять окно CIR [FP-half .. FP+half] в cir_snap. Активное DW-устройство уже
+ * выбрано вызывающим (PollRadio). Полуширина фиксирована CIR_HALF_MAX (окно
+ * максимально; GET_CIR при отдаче обрежет до запрошенной клиентом полуширины).
+ * Клампится к границам accumulator [0 .. acc_len-1]. Вызывать ТОЛЬКО из RXFCG
+ * ДО dwt_rxenable — иначе accumulator затирается перевзводом приёма (NOTES §5). */
+static void PROTOCOL_CaptureCIR(void)
+{
+    cir_snap.valid = 0;
+
+    /* Длина accumulator по PRF принимающего устройства. */
+    uint16_t acc_len = (dw_dev_state[DW_RX_LISTEN_DEV].prf == 64) ? 1016u : 992u;
+
+    /* Индекс first path: firstPath — 10.6 fixed-point, целый индекс = >>6 (÷64). */
+    uint16_t fp = (uint16_t)(rx_metrics.diag.firstPath >> 6);
+    if (fp >= acc_len) return;              /* защита: FP вне буфера — снимка нет */
+
+    /* Окно [fp-HALF .. fp+HALF], кламп к [0 .. acc_len-1]. */
+    uint16_t half  = CIR_HALF_MAX;
+    uint16_t start = (fp > half) ? (uint16_t)(fp - half) : 0u;
+    uint16_t end   = fp + half;
+    if (end >= acc_len) end = (uint16_t)(acc_len - 1u);
+    uint16_t count = (uint16_t)(end - start + 1u);
+    if (count > CIR_SNAP_MAXCNT) count = CIR_SNAP_MAXCNT;   /* страховка */
+
+    /* Чтение среза: dummy(1) + count*4 байт во временный буфер, затем копия в
+     * cir_snap.data БЕЗ первого (dummy) байта. */
+    static uint8_t tmp[1 + CIR_SNAP_BYTES];
+    uint16_t rd_len = (uint16_t)(count * 4u + 1u);
+    dwt_readaccdata(tmp, rd_len, (uint16_t)(start * 4u));
+
+    memcpy(cir_snap.data, &tmp[1], (size_t)(count * 4u));   /* отбросить dummy */
+
+    cir_snap.fp_index    = fp;
+    cir_snap.start_index = start;
+    cir_snap.count       = count;
+    cir_snap.valid       = 1;
+}
+
 /* ===========================================================================
  * ОБСЛУЖИВАНИЕ ПРИЁМА (main loop) — polling SYS_STATUS
  * ===========================================================================
@@ -951,6 +1061,8 @@ void PROTOCOL_PollRadio(void)
         rx_metrics.rxpacc_nosat = dwt_read16bitoffsetreg(DRX_CONF_ID, RXPACC_NOSAT_OFFSET);
         rx_metrics.valid = 1;
         rx_metrics.count++;
+
+        PROTOCOL_CaptureCIR();                  /* снять окно CIR вокруг FP ДО rxenable */
 
         dwt_rxenable(DWT_START_RX_IMMEDIATE);   /* снова слушаем */
     } else if (status & SYS_STATUS_ALL_RX_ERR) {
@@ -1020,6 +1132,7 @@ void PROTOCOL_RegisterAllHandlers(void)
     PROTOCOL_RegisterHandler(CMD_RX_START,           HandleRX_START);
     PROTOCOL_RegisterHandler(CMD_RX_STOP,            HandleRX_STOP);
     PROTOCOL_RegisterHandler(CMD_GET_SIGNAL_METRICS, HandleGET_SIGNAL_METRICS);
+    PROTOCOL_RegisterHandler(CMD_GET_CIR,            HandleGET_CIR);
     PROTOCOL_RegisterHandler(CMD_TX_FRAME,           HandleTX_FRAME);
     PROTOCOL_RegisterHandler(CMD_TX_STOP,            HandleTX_STOP);
     PROTOCOL_RegisterHandler(CMD_TX_PERIODIC,        HandleTX_PERIODIC);

@@ -35,6 +35,7 @@ mks_console.py — интерактивная консоль для управл
     txperiodic <T> <b0> ...   — TX_PERIODIC (период T мс + payload hex)
     txstop                    — TX_STOP
     metrics [prf]             — GET_SIGNAL_METRICS: сырьё + приближ. RSSI/FP_POWER
+    cir [half]                — GET_CIR: окно CIR вокруг first path (ASCII-бары)
     raw <hex...>              — послать произвольные PARAMS к произвольному CMD:
                                 raw <cmd_id> <b0> <b1> ...   (всё в hex)
     hex                       — переключить показ ответа в hex вкл/выкл
@@ -75,6 +76,9 @@ HELP = """\
   metrics [prf]                          GET_SIGNAL_METRICS (0x40): сырьё +
                                          приближ. RSSI/FP_POWER (dBm, UM §4.7).
                                          prf = 16 или 64 (по умолч. 64, Mode 3)
+  cir [half]                             GET_CIR (0x41): окно CIR вокруг first path
+                                         half = полуширина (0..30, 0 = дефолт 16).
+                                         Нужен принятый кадр после rxstart.
   raw <cmd_id> [b0 b1 ...]               произвольная команда, всё в hex
                                          пример: raw 00           (PING)
                                          пример: raw 10 02 00 00 04 09 40 20
@@ -170,6 +174,44 @@ def cmd_metrics(dev, args, show_hex):
             print(f"    (разбор не удался: {e})")
     elif st == 0x06:  # TIMEOUT
         print("    (кадр ещё не принят — valid=0; жди пакет EVK и повтори metrics)")
+
+
+def cmd_cir(dev, args, show_hex):
+    # опциональный аргумент: half (полуширина окна). 0/нет → дефолт прошивки.
+    half = 0
+    if args:
+        try:
+            half = int(args[0])
+        except ValueError:
+            print("  использование: cir [half]   (half = полуширина окна, 0..30)")
+            return
+    st, data = dev.get_cir(half)
+    show_response(st, data, show_hex)
+    if st != 0x00:
+        if st == 0x06:  # TIMEOUT
+            print("    (снимка CIR нет — после rxstart прими хотя бы один кадр, затем cir)")
+        return
+    try:
+        c = mks.parse_cir(data)
+    except Exception as e:
+        print(f"    (разбор не удался: {e})")
+        return
+
+    print(f"    fp_index   = {c['fp_index']}  (first path)")
+    print(f"    start_index= {c['start_index']}")
+    print(f"    count      = {c['count']}")
+
+    amps = c["amps"]
+    if not amps:
+        return
+    peak = max(amps) or 1.0
+    WIDTH = 50
+    # Строки: индекс отсчёта, амплитуда, бар. Маркер '<<FP' на first path.
+    for k, a in enumerate(amps):
+        idx = c["start_index"] + k
+        bar = "#" * int(round(a / peak * WIDTH))
+        mark = "  <<FP" if idx == c["fp_index"] else ""
+        print(f"    [{idx:4}] {a:8.0f} |{bar}{mark}")
 
 
 def cmd_txpower(dev, args, show_hex):
@@ -313,6 +355,8 @@ def main():
                     show_response(*dev.rx_stop(), show_hex)
                 elif cmd == "metrics":
                     cmd_metrics(dev, cargs, show_hex)
+                elif cmd == "cir":
+                    cmd_cir(dev, cargs, show_hex)
                 elif cmd == "txframe":
                     cmd_txframe(dev, cargs, show_hex)
                 elif cmd == "txperiodic":

@@ -43,6 +43,10 @@ v5 (2026-07-17): GET_SIGNAL_METRICS расширен 18→28→30 байт (ФИ
 считает строгий RSSI/FP_POWER (UM §4.7, RXPACC_NOSAT) и total SNR (= RSL + delta,
 delta из DecaRanging: 79.5 для каналов 1/2/3/5, 77.0 для 4/7).
 parse_signal_metrics поддерживает 18 (интерим) / 28 / 30 (финал) байт по длине.
+
+v6 (2026-07-17): добавлен GET_CIR (0x41) — окно CIR вокруг first path (half u8),
+parse_cir(). Прошивка снимает окно accumulator в ветке приёма (до перевзвода RX);
+центрирование по FP делает прошивка. Консольная псевдографика в mks_console.
 """
 
 from __future__ import annotations
@@ -50,7 +54,7 @@ import struct
 import time
 
 # Единый источник версии хостовых инструментов (баннер консоли берёт отсюда).
-HOST_VERSION = "5"
+HOST_VERSION = "6"
 
 SYNC = bytes([0xAA, 0x55])
 
@@ -66,6 +70,7 @@ CMD_TX_STOP            = 0x22
 CMD_RX_START           = 0x30
 CMD_RX_STOP            = 0x31
 CMD_GET_SIGNAL_METRICS = 0x40
+CMD_GET_CIR            = 0x41
 
 STATUS_NAMES = {
     0x00: "OK",
@@ -235,6 +240,17 @@ class MKS:
             raise ValueError("power_level вне диапазона u8")
         return self.command(CMD_SET_TX_POWER, bytes([power_level]), timeout=timeout)
 
+    def get_cir(self, half: int = 0, timeout=None):
+        """GET_CIR (0x41): окно CIR вокруг first path.
+        PARAMS = half u8 (полуширина окна; 0 = дефолт прошивки, макс. 30).
+        Ответ DATA: fp_index u16 LE, start_index u16 LE, count u16 LE, затем
+        count пар I/Q (int16 LE). Снимок делается прошивкой при приёме кадра
+        (в ветке RXFCG, до перевзвода RX). Требует, чтобы после RX_START был
+        принят хотя бы один кадр (иначе STATUS=TIMEOUT)."""
+        if not (0 <= half <= 0xFF):
+            raise ValueError("half вне диапазона u8")
+        return self.command(CMD_GET_CIR, bytes([half]), timeout=timeout)
+
 
 def parse_get_status(data: bytes) -> dict:
     if len(data) != 7:
@@ -304,6 +320,35 @@ def parse_signal_metrics(data: bytes) -> dict:
         f"GET_SIGNAL_METRICS: ожидалось 18 (интерим), 28 или 30 (финал) байт, "
         f"получено {len(data)}"
     )
+
+
+def parse_cir(data: bytes) -> dict:
+    """Разобрать DATA GET_CIR: заголовок 6 байт (fp_index, start_index, count —
+    u16 LE) + count пар I/Q (int16 LE). Возвращает dict с fp_index, start_index,
+    count, samples (список (i, q)) и amps (список sqrt(i^2+q^2))."""
+    if len(data) < 6:
+        raise ProtocolError(f"GET_CIR: заголовок 6 байт не помещается ({len(data)})")
+    fp_index, start_index, count = struct.unpack_from("<HHH", data, 0)
+    need = 6 + count * 4
+    if len(data) < need:
+        raise ProtocolError(
+            f"GET_CIR: тело короче заявленного (count={count} → надо {need}, "
+            f"есть {len(data)})")
+    samples = []
+    amps = []
+    off = 6
+    for _ in range(count):
+        i, q = struct.unpack_from("<hh", data, off)
+        off += 4
+        samples.append((i, q))
+        amps.append((i * i + q * q) ** 0.5)
+    return {
+        "fp_index": fp_index,
+        "start_index": start_index,
+        "count": count,
+        "samples": samples,
+        "amps": amps,
+    }
 
 
 def signal_metrics_ok(m: dict) -> bool:
