@@ -71,6 +71,7 @@ CMD_RX_START           = 0x30
 CMD_RX_STOP            = 0x31
 CMD_GET_SIGNAL_METRICS = 0x40
 CMD_GET_CIR            = 0x41
+CMD_SET_STREAM_MODE    = 0x42
 
 STATUS_NAMES = {
     0x00: "OK",
@@ -250,6 +251,16 @@ class MKS:
         if not (0 <= half <= 0xFF):
             raise ValueError("half вне диапазона u8")
         return self.command(CMD_GET_CIR, bytes([half]), timeout=timeout)
+
+    def set_stream_mode(self, mode: int, timeout=None):
+        """SET_STREAM_MODE (0x42): 0=выкл (командный режим), 1=вкл поток. DATA нет.
+        При mode=1 плата после КАЖДОГО принятого UWB-кадра сама шлёт потоковый кадр
+        (свой формат: SMARK 0xDE 0xCA | LEN16 | SEQ | DROPPED | метрики30+окноCIR |
+        CRC8) — читать отдельным приёмником (см. tools/mks_stream_probe.py). Пока
+        поток включён, командный канал занят потоковыми кадрами."""
+        if mode not in (0, 1):
+            raise ValueError("mode должен быть 0 или 1")
+        return self.command(CMD_SET_STREAM_MODE, bytes([mode]), timeout=timeout)
 
 
 def parse_get_status(data: bytes) -> dict:

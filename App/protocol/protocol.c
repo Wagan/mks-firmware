@@ -99,6 +99,19 @@ static uint8_t PROTOCOL_CalculateCRC(const uint8_t* data, uint8_t len)
     return crc;
 }
 
+/* CRC8 (тот же полином 0x07) по буферу длиной uint16 — для потокового кадра, где
+ * тело может быть >255 байт (окно CIR). Командную PROTOCOL_CalculateCRC не трогаем. */
+static uint8_t PROTOCOL_CalculateCRC16len(const uint8_t* data, uint16_t len)
+{
+    uint8_t crc = 0;
+    for (uint16_t i = 0; i < len; i++) {
+        crc ^= data[i];
+        for (uint8_t j = 0; j < 8; j++)
+            crc = (crc & 0x80) ? (uint8_t)((crc << 1) ^ 0x07) : (uint8_t)(crc << 1);
+    }
+    return crc;
+}
+
 /**
  * @brief Построить пакет ответа: [SYNC0 SYNC1][LEN][STATUS][DATA...][CRC].
  *        CRC считается по LEN+STATUS+DATA (без SYNC).
@@ -213,6 +226,13 @@ static struct {
     uint8_t  data[CIR_SNAP_BYTES];  /* I/Q без dummy: count*4 байт */
 } cir_snap;
 
+/* Состояние потокового режима (SET_STREAM_MODE 0x42, CIR-2). Отправка потоковых
+ * кадров — в PROTOCOL_PollRadio (ветка RXFCG). SEQ инкрементируется только на
+ * реально отправленный кадр; DROPPED растёт при CDC BUSY (кадр дропнут). */
+static volatile uint8_t stream_active;   /* 1 = потоковый режим включён */
+static uint16_t stream_seq;              /* номер отправленного потокового кадра */
+static uint16_t stream_dropped;          /* дропнуто по BUSY (нарастающий, u16) */
+
 /* ===========================================================================
  * ПАРСЕР ВХОДЯЩИХ БАЙТОВ
  * =========================================================================== */
@@ -238,6 +258,10 @@ void PROTOCOL_Init(void)
     tx_power_reg   = 0;
 
     cir_snap.valid = 0;
+
+    stream_active  = 0;
+    stream_seq     = 0;
+    stream_dropped = 0;
 }
 
 void PROTOCOL_ProcessByte(uint8_t byte)
@@ -726,6 +750,44 @@ static int16_t metrics_snr_q(const dwt_rxdiag_t* d, uint16_t N, float A, uint8_t
     return (int16_t)lrintf(snr * 100.0f);
 }
 
+/* Собрать 30 байт метрик (формат GET_SIGNAL_METRICS) в buf. Возвращает число байт.
+ * Единая точка сборки — командный ответ и потоковый кадр (CIR-2) не расходятся.
+ * Предполагает rx_metrics.valid==1 и активное устройство DW_RX_LISTEN_DEV. */
+static uint8_t build_metrics_block(uint8_t* buf)
+{
+    const dwt_rxdiag_t* d = &rx_metrics.diag;
+    uint8_t* p = buf;
+
+    /* Первые 18 байт — интерим-совместимость (не менять порядок). */
+    PUT_U16LE(p, rx_metrics.count); p += 2;
+    PUT_U16LE(p, d->maxGrowthCIR);  p += 2;
+    PUT_U16LE(p, d->rxPreamCount);  p += 2;
+    PUT_U16LE(p, d->stdNoise);      p += 2;
+    PUT_U16LE(p, d->firstPathAmp1); p += 2;
+    PUT_U16LE(p, d->firstPathAmp2); p += 2;
+    PUT_U16LE(p, d->firstPathAmp3); p += 2;
+    PUT_U16LE(p, d->firstPath);     p += 2;
+    PUT_U16LE(p, d->maxNoise);      p += 2;
+
+    /* Строгие поля (UM §4.7 / DecaRanging). */
+    uint8_t  prf_wire = dw_dev_state[DW_RX_LISTEN_DEV].prf;
+    float    A        = metrics_a_const(prf_wire);
+    uint16_t N        = metrics_corrected_n(d, rx_metrics.rxpacc_nosat);
+    int16_t  rssi_q   = metrics_rssi_q(d, N, A);
+    int16_t  fp_q     = metrics_fp_q(d, N, A);
+    uint16_t a_q      = (uint16_t)lrintf(A * 100.0f);
+    int16_t  snr_q    = metrics_snr_q(d, N, A, dw_dev_state[DW_RX_LISTEN_DEV].channel);
+
+    PUT_U16LE(p, rx_metrics.rxpacc_nosat); p += 2;
+    PUT_U16LE(p, N);                       p += 2;
+    PUT_U16LE(p, (uint16_t)rssi_q);        p += 2;   /* i16 в u16-контейнер, LE */
+    PUT_U16LE(p, (uint16_t)fp_q);          p += 2;
+    PUT_U16LE(p, a_q);                     p += 2;
+    PUT_U16LE(p, (uint16_t)snr_q);         p += 2;   /* total SNR, i16 dB×100, LE */
+
+    return (uint8_t)(p - buf);   /* 30 */
+}
+
 /**
  * @brief GET_SIGNAL_METRICS (0x40). Метрики последнего принятого кадра.
  *        Формат — 30 байт, u16 LE. Первые 18 байт (совместимость): count,
@@ -743,39 +805,10 @@ static ResponseStatus HandleGET_SIGNAL_METRICS(const uint8_t* params, uint8_t pa
     if (!rx_metrics.valid) return STATUS_TIMEOUT;   /* кадра ещё не принято */
 
     static uint8_t data[30];
-    const dwt_rxdiag_t* d = &rx_metrics.diag;
-    uint8_t* p = data;
-
-    /* Первые 18 байт — интерим-совместимость (не менять порядок). */
-    PUT_U16LE(p, rx_metrics.count); p += 2;
-    PUT_U16LE(p, d->maxGrowthCIR);  p += 2;
-    PUT_U16LE(p, d->rxPreamCount);  p += 2;
-    PUT_U16LE(p, d->stdNoise);      p += 2;
-    PUT_U16LE(p, d->firstPathAmp1); p += 2;
-    PUT_U16LE(p, d->firstPathAmp2); p += 2;
-    PUT_U16LE(p, d->firstPathAmp3); p += 2;
-    PUT_U16LE(p, d->firstPath);     p += 2;
-    PUT_U16LE(p, d->maxNoise);      p += 2;
-
-    /* Строгие поля (UM §4.7), дописаны в конец. */
-    uint8_t  prf_wire = dw_dev_state[DW_RX_LISTEN_DEV].prf;
-    float    A        = metrics_a_const(prf_wire);
-    uint16_t N        = metrics_corrected_n(d, rx_metrics.rxpacc_nosat);
-    int16_t  rssi_q   = metrics_rssi_q(d, N, A);
-    int16_t  fp_q     = metrics_fp_q(d, N, A);
-    uint16_t a_q      = (uint16_t)lrintf(A * 100.0f);
-
-    int16_t  snr_q    = metrics_snr_q(d, N, A, dw_dev_state[DW_RX_LISTEN_DEV].channel);
-
-    PUT_U16LE(p, rx_metrics.rxpacc_nosat); p += 2;
-    PUT_U16LE(p, N);                       p += 2;
-    PUT_U16LE(p, (uint16_t)rssi_q);        p += 2;   /* i16 в u16-контейнер, LE */
-    PUT_U16LE(p, (uint16_t)fp_q);          p += 2;
-    PUT_U16LE(p, a_q);                     p += 2;
-    PUT_U16LE(p, (uint16_t)snr_q);         p += 2;   /* total SNR, i16 dB×100, LE */
+    uint8_t n = build_metrics_block(data);
 
     *out_data = data;
-    *out_len  = 30;
+    *out_len  = n;
     return STATUS_OK;
 }
 
@@ -830,6 +863,26 @@ static ResponseStatus HandleGET_CIR(const uint8_t* params, uint8_t params_len,
 
     *out_data = data;
     *out_len  = (uint8_t)(p - data);   /* <= 250, помещается в u8 LEN */
+    return STATUS_OK;
+}
+
+/**
+ * @brief SET_STREAM_MODE (0x42). mode u8 (0=выкл/командный, 1=вкл поток). При
+ *        ВКЛючении сбрасывает счётчики seq/dropped. DATA нет. Сами потоковые кадры
+ *        шлёт PROTOCOL_PollRadio (ветка RXFCG) своим форматом (SMARK 0xDECA).
+ */
+static ResponseStatus HandleSET_STREAM_MODE(const uint8_t* params, uint8_t params_len,
+                                            uint8_t** out_data, uint8_t* out_len)
+{
+    (void)out_data;
+    *out_len = 0;
+
+    if (params_len < 1) return STATUS_INVALID_PARAM;
+    uint8_t mode = params[0];
+    if (mode > 1) return STATUS_INVALID_PARAM;
+
+    if (mode == 1) { stream_seq = 0; stream_dropped = 0; }
+    stream_active = mode;
     return STATUS_OK;
 }
 
@@ -992,6 +1045,50 @@ static ResponseStatus HandleSET_TX_POWER(const uint8_t* params, uint8_t params_l
     return STATUS_OK;
 }
 
+/* Собрать потоковый кадр (метрики + окно CIR из cir_snap) и отправить в USB CDC.
+ * Формат (СВОЙ, отдельный от командного): SMARK(0xDE 0xCA) | LEN16 | SEQ | DROPPED |
+ * PAYLOAD(метрики30 + окноCIR) | CRC8. LEN16 = байт после LEN16 и до CRC
+ * (SEQ+DROPPED+PAYLOAD); CRC8 по [LEN16..PAYLOAD] (SMARK не входит). При BUSY —
+ * дроп: dropped++, SEQ не инкрементируем. Устройство DW_RX_LISTEN_DEV уже выбрано
+ * вызывающим (PollRadio). Окно CIR — весь снимок cir_snap (фикс. полуширина захвата). */
+static void PROTOCOL_SendStreamFrame(void)
+{
+    static uint8_t frame[320];   /* с запасом; макс ~297 байт при полном снимке */
+    uint8_t* p = frame;
+
+    *p++ = 0xDE; *p++ = 0xCA;               /* SMARK */
+
+    uint8_t* len_field = p; p += 2;         /* место под LEN16 (заполним в конце) */
+
+    PUT_U16LE(p, stream_seq);     p += 2;   /* SEQ */
+    PUT_U16LE(p, stream_dropped); p += 2;   /* DROPPED */
+
+    p += build_metrics_block(p);            /* 30 байт метрик */
+
+    /* Окно CIR из cir_snap: заголовок 6 байт + I/Q (формат как DATA у GET_CIR). */
+    PUT_U16LE(p, cir_snap.fp_index);    p += 2;
+    PUT_U16LE(p, cir_snap.start_index); p += 2;
+    PUT_U16LE(p, cir_snap.count);       p += 2;
+    memcpy(p, cir_snap.data, (size_t)(cir_snap.count * 4u));
+    p += cir_snap.count * 4u;
+
+    /* LEN16 = байт от body (SEQ) до конца PAYLOAD = (p) - (len_field+2). */
+    uint16_t body_len = (uint16_t)(p - (len_field + 2));
+    PUT_U16LE(len_field, body_len);
+
+    /* CRC8 по [LEN16 .. конец PAYLOAD) = [len_field .. p). */
+    *p = PROTOCOL_CalculateCRC16len(len_field, (uint16_t)(p - len_field));
+    p++;
+
+    uint16_t total = (uint16_t)(p - frame);
+
+    if (CDC_Transmit_FS(frame, total) == USBD_OK) {
+        stream_seq++;
+    } else {
+        stream_dropped++;                   /* BUSY/ошибка — кадр дропнут */
+    }
+}
+
 /* Снять окно CIR [FP-half .. FP+half] в cir_snap. Активное DW-устройство уже
  * выбрано вызывающим (PollRadio). Полуширина фиксирована CIR_HALF_MAX (окно
  * максимально; GET_CIR при отдаче обрежет до запрошенной клиентом полуширины).
@@ -1064,6 +1161,10 @@ void PROTOCOL_PollRadio(void)
 
         PROTOCOL_CaptureCIR();                  /* снять окно CIR вокруг FP ДО rxenable */
 
+        if (stream_active) {
+            PROTOCOL_SendStreamFrame();         /* потоковый кадр (метрики+CIR) ДО rxenable */
+        }
+
         dwt_rxenable(DWT_START_RX_IMMEDIATE);   /* снова слушаем */
     } else if (status & SYS_STATUS_ALL_RX_ERR) {
         /* Ошибка приёма: снять флаги, сброс приёмника (реинициализация LDE). */
@@ -1133,6 +1234,7 @@ void PROTOCOL_RegisterAllHandlers(void)
     PROTOCOL_RegisterHandler(CMD_RX_STOP,            HandleRX_STOP);
     PROTOCOL_RegisterHandler(CMD_GET_SIGNAL_METRICS, HandleGET_SIGNAL_METRICS);
     PROTOCOL_RegisterHandler(CMD_GET_CIR,            HandleGET_CIR);
+    PROTOCOL_RegisterHandler(CMD_SET_STREAM_MODE,    HandleSET_STREAM_MODE);
     PROTOCOL_RegisterHandler(CMD_TX_FRAME,           HandleTX_FRAME);
     PROTOCOL_RegisterHandler(CMD_TX_STOP,            HandleTX_STOP);
     PROTOCOL_RegisterHandler(CMD_TX_PERIODIC,        HandleTX_PERIODIC);

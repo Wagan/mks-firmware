@@ -50,6 +50,7 @@ typedef enum {
     /* Диагностика */
     CMD_GET_SIGNAL_METRICS  = 0x40,
     CMD_GET_CIR             = 0x41,
+    CMD_SET_STREAM_MODE     = 0x42,   /* вкл/выкл потоковый режим (CIR-2) */
     
     /* Эксперименты */
     CMD_START_EXPERIMENT    = 0x50,
