@@ -24,5 +24,9 @@ Thumbs.db
 *.bak
 *.swp
 
+# --- Локальные планировочные артефакты (держим на диске, НЕ коммитим) ---
+/docs/reference/recon.txt
+/docs/reference/tx_planning_sources.zip
+
 # --- Keep these (do NOT ignore): ---
 # .project, .cproject, *.ioc, *.ld  -- эти файлы коммитим
