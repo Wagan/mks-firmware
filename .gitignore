@@ -30,6 +30,7 @@ Thumbs.db
 docs/reference/**/*.zip
 recon_*.txt
 /docs/reference/recon.txt
+tools/*.png
 
 # --- Keep these (do NOT ignore): ---
 # .project, .cproject, *.ioc, *.ld  -- эти файлы коммитим
