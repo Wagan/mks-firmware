@@ -24,13 +24,12 @@ Thumbs.db
 *.bak
 *.swp
 
-# --- Локальные планировочные артефакты (держим на диске, НЕ коммитим) ---
+# --- Справочные/планировочные артефакты (воспроизводимы, НЕ в репозитории) ---
+# Архивы исходников DecaWave и планировочные zip под docs/reference; recon-выгрузки.
+# NB: РАСПАКОВАННЫЕ исходники декавейва (референс) НЕ игнорируем — только .zip.
+docs/reference/**/*.zip
+recon_*.txt
 /docs/reference/recon.txt
-/docs/reference/tx_planning_sources.zip
-/docs/reference/recon_txperiodic.txt
-/docs/reference/txperiodic_src.zip
-/tools/recon_settxpower.txt
-/recon_settxpower.txt
 
 # --- Keep these (do NOT ignore): ---
 # .project, .cproject, *.ioc, *.ld  -- эти файлы коммитим
