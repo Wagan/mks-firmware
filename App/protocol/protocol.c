@@ -181,6 +181,16 @@ static struct {
 
 static uint8_t rx_frame[RX_FRAME_MAX];  /* последний принятый кадр */
 
+/* Состояние периодической передачи (TX_PERIODIC). Скаляры — здесь (нужны в
+ * PROTOCOL_Init, объявленном ниже); буфер кадра tx_periodic_frame[TX_FRAME_MAX] —
+ * рядом с определением TX_FRAME_MAX (перед HandleTX_FRAME), т.к. до него define
+ * ещё не виден. Реальная посылка — в PROTOCOL_PollTx (main loop). */
+static volatile uint8_t tx_periodic_active;   /* 1 = режим TX_PERIODIC включён */
+static uint16_t  tx_period_ms;                /* период посылки, мс */
+static uint32_t  tx_last_ms;                  /* HAL_GetTick() последней посылки */
+static uint16_t  tx_periodic_len;             /* длина payload */
+static uint32_t  tx_periodic_count;           /* послано кадров (диагностика) */
+
 /* ===========================================================================
  * ПАРСЕР ВХОДЯЩИХ БАЙТОВ
  * =========================================================================== */
@@ -197,6 +207,9 @@ void PROTOCOL_Init(void)
     rx_active         = 0;
     rx_metrics.valid  = 0;
     rx_metrics.count  = 0;
+
+    tx_periodic_active = 0;
+    tx_periodic_count  = 0;
 }
 
 void PROTOCOL_ProcessByte(uint8_t byte)
@@ -628,6 +641,13 @@ static ResponseStatus HandleGET_SIGNAL_METRICS(const uint8_t* params, uint8_t pa
 #define TX_FRAME_MAX    125
 #define TX_WAIT_GUARD   100000u
 
+/* Нижняя граница периода TX_PERIODIC (мс). Защита от «шторма»: эфирное время
+ * кадра Mode3 ~сотни мкс + busy-wait TXFRS; 5 мс — запас, USB не голодает. */
+#define TX_PERIOD_MIN_MS  5
+
+/* Копия payload периодического кадра (params диспетчера переиспользуются). */
+static uint8_t tx_periodic_frame[TX_FRAME_MAX];
+
 /**
  * @brief TX_FRAME (0x20). Передать одиночный кадр с модуля DW_TX_SOURCE_DEV.
  *        Параметры (wire, §6): length u16 LE, payload[length].
@@ -678,8 +698,38 @@ static ResponseStatus HandleTX_STOP(const uint8_t* params, uint8_t params_len,
     (void)params; (void)params_len; (void)out_data;
     *out_len = 0;
 
+    tx_periodic_active = 0;   /* остановить периодику (если была) — единая точка останова */
     if (deca_port_select_device(DW_TX_SOURCE_DEV) != DWT_SUCCESS) return STATUS_RADIO_ERROR;
     dwt_forcetrxoff();
+    return STATUS_OK;
+}
+
+/**
+ * @brief TX_PERIODIC (0x21). Взвести режим периодической передачи и вернуть OK.
+ *        Параметры (wire, §6): period_ms u16 LE, length u16 LE, payload[length].
+ *        Реальная посылка — в PROTOCOL_PollTx() (main loop). Требует INIT.
+ *        Останавливается командой TX_STOP. payload копируется (params переиспользуются).
+ */
+static ResponseStatus HandleTX_PERIODIC(const uint8_t* params, uint8_t params_len,
+                                        uint8_t** out_data, uint8_t* out_len)
+{
+    (void)out_data;
+    *out_len = 0;
+
+    if (params_len < 4) return STATUS_INVALID_PARAM;          /* нет period+length */
+    uint16_t period = GET_U16LE(&params[0]);
+    uint16_t length = GET_U16LE(&params[2]);
+    if (length > TX_FRAME_MAX)       return STATUS_BUFFER_OVERFLOW;
+    if (params_len < 4 + length)     return STATUS_INVALID_PARAM;  /* payload короче заявленного */
+    if (period < TX_PERIOD_MIN_MS)   return STATUS_INVALID_PARAM;  /* защита от шторма */
+    if (!dw_dev_state[DW_TX_SOURCE_DEV].initialized) return STATUS_RADIO_ERROR;
+
+    memcpy(tx_periodic_frame, &params[4], length);
+    tx_periodic_len    = length;
+    tx_period_ms       = period;
+    tx_periodic_count  = 0;
+    tx_last_ms         = HAL_GetTick() - period;   /* первая посылка — сразу */
+    tx_periodic_active = 1;
     return STATUS_OK;
 }
 
@@ -724,6 +774,38 @@ void PROTOCOL_PollRadio(void)
 }
 
 /* ===========================================================================
+ * ОБСЛУЖИВАНИЕ ПЕРИОДИЧЕСКОЙ ПЕРЕДАЧИ (main loop) — интервал по HAL_GetTick()
+ * ===========================================================================
+ * Если включён режим TX_PERIODIC, по достижении tx_period_ms шлёт кадр с
+ * DW_TX_SOURCE_DEV тем же паттерном, что HandleTX_FRAME. Ошибки не возвращаются
+ * наружу (команда уже завершилась при взведении режима); сбой = пропуск периода.
+ */
+void PROTOCOL_PollTx(void)
+{
+    if (!tx_periodic_active) return;
+
+    uint32_t now = HAL_GetTick();
+    if ((uint32_t)(now - tx_last_ms) < tx_period_ms) return;   /* ещё рано */
+    tx_last_ms = now;
+
+    if (deca_port_select_device(DW_TX_SOURCE_DEV) != DWT_SUCCESS) return;
+
+    dwt_write32bitreg(SYS_STATUS_ID, SYS_STATUS_TXFRS);
+    if (dwt_writetxdata((uint16_t)(tx_periodic_len + 2), tx_periodic_frame, 0) != DWT_SUCCESS)
+        return;
+    dwt_writetxfctrl((uint16_t)(tx_periodic_len + 2), 0, 0);
+    if (dwt_starttx(DWT_START_TX_IMMEDIATE) != DWT_SUCCESS)
+        return;
+
+    uint32_t guard = TX_WAIT_GUARD;
+    while (!(dwt_read32bitreg(SYS_STATUS_ID) & SYS_STATUS_TXFRS)) {
+        if (--guard == 0) break;          /* кадр не ушёл — пропускаем период */
+    }
+    dwt_write32bitreg(SYS_STATUS_ID, SYS_STATUS_TXFRS);
+    tx_periodic_count++;
+}
+
+/* ===========================================================================
  * РЕГИСТРАЦИЯ ОБРАБОТЧИКОВ
  * =========================================================================== */
 void PROTOCOL_RegisterHandler(CommandID cmd, CommandHandler handler)
@@ -750,5 +832,6 @@ void PROTOCOL_RegisterAllHandlers(void)
     PROTOCOL_RegisterHandler(CMD_GET_SIGNAL_METRICS, HandleGET_SIGNAL_METRICS);
     PROTOCOL_RegisterHandler(CMD_TX_FRAME,           HandleTX_FRAME);
     PROTOCOL_RegisterHandler(CMD_TX_STOP,            HandleTX_STOP);
+    PROTOCOL_RegisterHandler(CMD_TX_PERIODIC,        HandleTX_PERIODIC);
     /* Остальные CMD_ID остаются NULL → STATUS_UNKNOWN_CMD. */
 }

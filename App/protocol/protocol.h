@@ -114,6 +114,11 @@ void PROTOCOL_PollRx(void);
  * (thread mode) рядом с PROTOCOL_PollRx(). Активно только после RX_START. */
 void PROTOCOL_PollRadio(void);
 
+/* Обслуживание периодической передачи: если включён режим TX_PERIODIC, по
+ * достижении периода шлёт кадр с DW_TX_SOURCE_DEV. Вызывается из main loop
+ * (thread mode) рядом с PROTOCOL_PollRadio(). Активно только после TX_PERIODIC. */
+void PROTOCOL_PollTx(void);
+
 /* Число отброшенных при переполнении rx-кольца байт (диагностика). */
 uint32_t PROTOCOL_RxOverflowCount(void);
 

@@ -119,6 +119,7 @@ int main(void)
     /* USER CODE BEGIN 3 */
     PROTOCOL_PollRx();      /* разбор накопленных USB-байт в thread mode */
     PROTOCOL_PollRadio();   /* обслуживание радиоприёма (RXFCG/ошибки) */
+    PROTOCOL_PollTx();      /* обслуживание периодической передачи (TX_PERIODIC) */
   }
   /* USER CODE END 3 */
 }
