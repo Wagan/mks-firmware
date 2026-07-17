@@ -253,13 +253,14 @@ class MKS:
         return self.command(CMD_GET_CIR, bytes([half]), timeout=timeout)
 
     def set_stream_mode(self, mode: int, timeout=None):
-        """SET_STREAM_MODE (0x42): 0=выкл (командный режим), 1=вкл поток. DATA нет.
-        При mode=1 плата после КАЖДОГО принятого UWB-кадра сама шлёт потоковый кадр
-        (свой формат: SMARK 0xDE 0xCA | LEN16 | SEQ | DROPPED | метрики30+окноCIR |
-        CRC8) — читать отдельным приёмником (см. tools/mks_stream_probe.py). Пока
-        поток включён, командный канал занят потоковыми кадрами."""
-        if mode not in (0, 1):
-            raise ValueError("mode должен быть 0 или 1")
+        """SET_STREAM_MODE (0x42): 0=выкл (командный режим); 1=вкл (метрики+CIR);
+        2=вкл (только метрики). DATA нет. При вкл плата после КАЖДОГО принятого
+        UWB-кадра сама шлёт потоковый кадр (свой формат: SMARK 0xDE 0xCA | LEN16 |
+        SEQ | DROPPED | CONTENT | PAYLOAD | CRC8; CONTENT=1 → метрики30+окноCIR,
+        CONTENT=2 → только метрики30) — читать отдельным приёмником (см.
+        tools/mks_stream_probe.py). Пока поток включён, командный канал занят потоком."""
+        if mode not in (0, 1, 2):
+            raise ValueError("mode должен быть 0, 1 или 2")
         return self.command(CMD_SET_STREAM_MODE, bytes([mode]), timeout=timeout)
 
 

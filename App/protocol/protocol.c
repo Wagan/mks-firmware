@@ -230,6 +230,7 @@ static struct {
  * кадров — в PROTOCOL_PollRadio (ветка RXFCG). SEQ инкрементируется только на
  * реально отправленный кадр; DROPPED растёт при CDC BUSY (кадр дропнут). */
 static volatile uint8_t stream_active;   /* 1 = потоковый режим включён */
+static uint8_t  stream_content;          /* содержимое: 1=метрики+CIR, 2=только метрики */
 static uint16_t stream_seq;              /* номер отправленного потокового кадра */
 static uint16_t stream_dropped;          /* дропнуто по BUSY (нарастающий, u16) */
 
@@ -260,6 +261,7 @@ void PROTOCOL_Init(void)
     cir_snap.valid = 0;
 
     stream_active  = 0;
+    stream_content = 1;
     stream_seq     = 0;
     stream_dropped = 0;
 }
@@ -867,9 +869,10 @@ static ResponseStatus HandleGET_CIR(const uint8_t* params, uint8_t params_len,
 }
 
 /**
- * @brief SET_STREAM_MODE (0x42). mode u8 (0=выкл/командный, 1=вкл поток). При
- *        ВКЛючении сбрасывает счётчики seq/dropped. DATA нет. Сами потоковые кадры
- *        шлёт PROTOCOL_PollRadio (ветка RXFCG) своим форматом (SMARK 0xDECA).
+ * @brief SET_STREAM_MODE (0x42). mode u8: 0=выкл/командный; 1=вкл (метрики+CIR);
+ *        2=вкл (только метрики). При ВКЛючении сбрасывает seq/dropped и запоминает
+ *        содержимое (stream_content). DATA нет. Потоковые кадры шлёт
+ *        PROTOCOL_PollRadio (ветка RXFCG) своим форматом (SMARK 0xDECA).
  */
 static ResponseStatus HandleSET_STREAM_MODE(const uint8_t* params, uint8_t params_len,
                                             uint8_t** out_data, uint8_t* out_len)
@@ -879,10 +882,15 @@ static ResponseStatus HandleSET_STREAM_MODE(const uint8_t* params, uint8_t param
 
     if (params_len < 1) return STATUS_INVALID_PARAM;
     uint8_t mode = params[0];
-    if (mode > 1) return STATUS_INVALID_PARAM;
+    if (mode > 2) return STATUS_INVALID_PARAM;
 
-    if (mode == 1) { stream_seq = 0; stream_dropped = 0; }
-    stream_active = mode;
+    if (mode == 0) {
+        stream_active = 0;
+    } else {
+        stream_seq = 0; stream_dropped = 0;
+        stream_content = mode;         /* 1=метрики+CIR, 2=только метрики */
+        stream_active = 1;
+    }
     return STATUS_OK;
 }
 
@@ -1045,15 +1053,16 @@ static ResponseStatus HandleSET_TX_POWER(const uint8_t* params, uint8_t params_l
     return STATUS_OK;
 }
 
-/* Собрать потоковый кадр (метрики + окно CIR из cir_snap) и отправить в USB CDC.
- * Формат (СВОЙ, отдельный от командного): SMARK(0xDE 0xCA) | LEN16 | SEQ | DROPPED |
- * PAYLOAD(метрики30 + окноCIR) | CRC8. LEN16 = байт после LEN16 и до CRC
- * (SEQ+DROPPED+PAYLOAD); CRC8 по [LEN16..PAYLOAD] (SMARK не входит). При BUSY —
- * дроп: dropped++, SEQ не инкрементируем. Устройство DW_RX_LISTEN_DEV уже выбрано
- * вызывающим (PollRadio). Окно CIR — весь снимок cir_snap (фикс. полуширина захвата). */
+/* Собрать потоковый кадр и отправить в USB CDC. Формат (СВОЙ, отдельный от
+ * командного): SMARK(0xDE 0xCA) | LEN16 | SEQ | DROPPED | CONTENT | PAYLOAD | CRC8.
+ * CONTENT=1 → PAYLOAD = метрики30 + окноCIR; CONTENT=2 → PAYLOAD = метрики30.
+ * LEN16 = байт после LEN16 и до CRC (SEQ+DROPPED+CONTENT+PAYLOAD); CRC8 по
+ * [LEN16..PAYLOAD] (SMARK не входит). При BUSY — дроп: dropped++, SEQ не трогаем.
+ * Устройство DW_RX_LISTEN_DEV уже выбрано вызывающим (PollRadio). Окно CIR — весь
+ * снимок cir_snap (фикс. полуширина захвата). */
 static void PROTOCOL_SendStreamFrame(void)
 {
-    static uint8_t frame[320];   /* с запасом; макс ~297 байт при полном снимке */
+    static uint8_t frame[320];   /* с запасом; макс ~298 байт при полном снимке+CONTENT */
     uint8_t* p = frame;
 
     *p++ = 0xDE; *p++ = 0xCA;               /* SMARK */
@@ -1062,15 +1071,18 @@ static void PROTOCOL_SendStreamFrame(void)
 
     PUT_U16LE(p, stream_seq);     p += 2;   /* SEQ */
     PUT_U16LE(p, stream_dropped); p += 2;   /* DROPPED */
+    *p++ = stream_content;                  /* CONTENT: 1=метрики+CIR, 2=метрики */
 
-    p += build_metrics_block(p);            /* 30 байт метрик */
+    p += build_metrics_block(p);            /* 30 байт метрик (всегда) */
 
-    /* Окно CIR из cir_snap: заголовок 6 байт + I/Q (формат как DATA у GET_CIR). */
-    PUT_U16LE(p, cir_snap.fp_index);    p += 2;
-    PUT_U16LE(p, cir_snap.start_index); p += 2;
-    PUT_U16LE(p, cir_snap.count);       p += 2;
-    memcpy(p, cir_snap.data, (size_t)(cir_snap.count * 4u));
-    p += cir_snap.count * 4u;
+    if (stream_content == 1) {
+        /* Окно CIR из cir_snap: заголовок 6 байт + I/Q (формат как DATA у GET_CIR). */
+        PUT_U16LE(p, cir_snap.fp_index);    p += 2;
+        PUT_U16LE(p, cir_snap.start_index); p += 2;
+        PUT_U16LE(p, cir_snap.count);       p += 2;
+        memcpy(p, cir_snap.data, (size_t)(cir_snap.count * 4u));
+        p += cir_snap.count * 4u;
+    }
 
     /* LEN16 = байт от body (SEQ) до конца PAYLOAD = (p) - (len_field+2). */
     uint16_t body_len = (uint16_t)(p - (len_field + 2));
