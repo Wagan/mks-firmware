@@ -640,10 +640,16 @@ static ResponseStatus HandleRX_STOP(const uint8_t* params, uint8_t params_len,
  * срабатывает — значение защитное, но заложено документально. */
 #define SFD_CORRECTION_MODE3  82
 
-/* A-константа по PRF (raw wire), UM §4.7. */
+/* delta для total SNR (SNR = RSL + delta), значения из DecaRanging instance_log.c:
+ * delta = 87 − 7.5 = 79.5 (каналы 1,2,3,5); для каналов 4/7 delta −= 2.5 = 77.0. */
+#define SNR_DELTA_DEFAULT  79.5f
+#define SNR_DELTA_CH47     77.0f
+
+/* A-константа по PRF (raw wire). Источник — DecaRanging instance_log.c
+ * (alpha: PRF64 = −121.74, PRF16 = −115.72; у нас это −A). UM §4.7. */
 static float metrics_a_const(uint8_t prf_wire)
 {
-    return (prf_wire == 64) ? 121.74f : 113.77f;
+    return (prf_wire == 64) ? 121.74f : 115.72f;
 }
 
 /* N (число символов преамбулы) с SFD-коррекцией по UM стр. 96. */
@@ -658,13 +664,20 @@ static uint16_t metrics_corrected_n(const dwt_rxdiag_t* d, uint16_t nosat)
     return rxpacc;                               /* коррекция не нужна */
 }
 
+/* RSL (RX_LEVEL) в dBm (float) — единая формула UM §4.7 (сверена с хостом Δ=0.00).
+ * Используется в metrics_rssi_q И metrics_snr_q (без дублирования). Предполагает
+ * валидные входы (N>0, maxGrowthCIR>0); проверку края делают вызывающие. */
+static float metrics_rssi_dbm(const dwt_rxdiag_t* d, uint16_t N, float A)
+{
+    float n2 = (float)N * (float)N;
+    return 10.0f * log10f(((float)d->maxGrowthCIR * 131072.0f) / n2) - A;
+}
+
 /* RSSI (RX_LEVEL) в dBm×100. Крайние случаи (N=0 или C=0) → INT16_MIN («н/д»). */
 static int16_t metrics_rssi_q(const dwt_rxdiag_t* d, uint16_t N, float A)
 {
     if (N == 0 || d->maxGrowthCIR == 0) return INT16_MIN;
-    float n2 = (float)N * (float)N;
-    float v  = 10.0f * log10f(((float)d->maxGrowthCIR * 131072.0f) / n2) - A;
-    return (int16_t)lrintf(v * 100.0f);
+    return (int16_t)lrintf(metrics_rssi_dbm(d, N, A) * 100.0f);
 }
 
 /* FP_POWER в dBm×100. Крайние случаи (N=0 или сумма амплитуд=0) → INT16_MIN. */
@@ -679,14 +692,30 @@ static int16_t metrics_fp_q(const dwt_rxdiag_t* d, uint16_t N, float A)
     return (int16_t)lrintf(v * 100.0f);
 }
 
+/* delta для total SNR по каналу (DecaRanging instance_log.c): {4,7} → 77.0,
+ * иначе 79.5. Написано по образцу metrics_a_const. */
+static float metrics_delta_for_channel(uint8_t channel)
+{
+    return (channel == 4 || channel == 7) ? SNR_DELTA_CH47 : SNR_DELTA_DEFAULT;
+}
+
+/* total SNR в dB×100 = RSL_dBm + delta (DecaRanging: знак ПЛЮС). Крайние случаи —
+ * те же, что дают INT16_MIN у RSL (N=0 или C=0). delta — по каналу RX-устройства. */
+static int16_t metrics_snr_q(const dwt_rxdiag_t* d, uint16_t N, float A, uint8_t channel)
+{
+    if (N == 0 || d->maxGrowthCIR == 0) return INT16_MIN;
+    float snr = metrics_rssi_dbm(d, N, A) + metrics_delta_for_channel(channel);
+    return (int16_t)lrintf(snr * 100.0f);
+}
+
 /**
  * @brief GET_SIGNAL_METRICS (0x40). Метрики последнего принятого кадра.
- *        Формат — 28 байт, u16 LE. Первые 18 байт (совместимость): count,
+ *        Формат — 30 байт, u16 LE. Первые 18 байт (совместимость): count,
  *        maxGrowthCIR, rxPreamCount, stdNoise, firstPathAmp1..3, firstPath,
- *        maxNoise. Далее СТРОГИЕ поля (UM §4.7): RXPACC_NOSAT, N_corrected,
- *        RSSI (i16 dBm×100), FP_POWER (i16 dBm×100), A_used×100. RSSI/FP_POWER
- *        считаются в прошивке на float; N/д → INT16_MIN. SNR — отдельный заход.
- *        Если кадра ещё не было (valid==0) → TIMEOUT.
+ *        maxNoise. Далее СТРОГИЕ поля (UM §4.7 / DecaRanging): RXPACC_NOSAT,
+ *        N_corrected, RSSI (i16 dBm×100), FP_POWER (i16 dBm×100), A_used×100,
+ *        SNR (i16 dB×100 = RSL+delta). Считаются в прошивке на float; N/д →
+ *        INT16_MIN. Если кадра ещё не было (valid==0) → TIMEOUT.
  */
 static ResponseStatus HandleGET_SIGNAL_METRICS(const uint8_t* params, uint8_t params_len,
                                                uint8_t** out_data, uint8_t* out_len)
@@ -695,7 +724,7 @@ static ResponseStatus HandleGET_SIGNAL_METRICS(const uint8_t* params, uint8_t pa
 
     if (!rx_metrics.valid) return STATUS_TIMEOUT;   /* кадра ещё не принято */
 
-    static uint8_t data[28];
+    static uint8_t data[30];
     const dwt_rxdiag_t* d = &rx_metrics.diag;
     uint8_t* p = data;
 
@@ -718,14 +747,17 @@ static ResponseStatus HandleGET_SIGNAL_METRICS(const uint8_t* params, uint8_t pa
     int16_t  fp_q     = metrics_fp_q(d, N, A);
     uint16_t a_q      = (uint16_t)lrintf(A * 100.0f);
 
+    int16_t  snr_q    = metrics_snr_q(d, N, A, dw_dev_state[DW_RX_LISTEN_DEV].channel);
+
     PUT_U16LE(p, rx_metrics.rxpacc_nosat); p += 2;
     PUT_U16LE(p, N);                       p += 2;
     PUT_U16LE(p, (uint16_t)rssi_q);        p += 2;   /* i16 в u16-контейнер, LE */
     PUT_U16LE(p, (uint16_t)fp_q);          p += 2;
     PUT_U16LE(p, a_q);                     p += 2;
+    PUT_U16LE(p, (uint16_t)snr_q);         p += 2;   /* total SNR, i16 dB×100, LE */
 
     *out_data = data;
-    *out_len  = 28;
+    *out_len  = 30;
     return STATUS_OK;
 }
 
