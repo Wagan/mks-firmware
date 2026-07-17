@@ -22,6 +22,11 @@ RXPACC_NOSAT, которого в интерим-формате нет).
 v3 (2026-07-17): добавлен TX_PERIODIC(0x21) — периодическая передача кадра
 (PARAMS = period_ms u16 LE + length u16 LE + payload). Останов — существующим
 TX_STOP(0x22), который теперь снимает и периодику.
+
+v4 (2026-07-17): добавлен SET_TX_POWER(0x11) — ручная регулировка мощности TX
+(вариант A: power_level u8, БОЛЬШЕ level → БОЛЬШЕ мощность; 0≈мин, 0xDF≈макс).
+Ответ DATA = применённый регистр power (u32 LE). Требует предварительного
+SET_PHY_CONFIG. Проверено loopback M1→M2: RX_LEVEL монотонно растёт с level.
 """
 
 from __future__ import annotations
@@ -198,6 +203,18 @@ class MKS:
 
     def tx_stop(self, timeout=None):
         return self.command(CMD_TX_STOP, timeout=timeout)
+
+    def set_tx_power(self, power_level: int, timeout=None):
+        """SET_TX_POWER (0x11): ручная регулировка мощности передатчика (вариант A).
+        PARAMS = power_level u8. БОЛЬШЕ power_level → БОЛЬШЕ мощность (0 ≈ минимум,
+        POWER_LEVEL_MAX=0xDF ≈ максимум; шаг ≈ 0.5 dB). Прошивка ограничивает
+        сверху 0xDF. Требует предварительного SET_PHY_CONFIG (нужен канал).
+        Ответ DATA = применённое значение регистра power (u32 LE, 4 байта).
+        Реализация: octet = 0xFF - power_level, дублируется во все 4 октета —
+        т.е. рост power_level уменьшает аттенюацию DA/mixer → мощность растёт."""
+        if not (0 <= power_level <= 0xFF):
+            raise ValueError("power_level вне диапазона u8")
+        return self.command(CMD_SET_TX_POWER, bytes([power_level]), timeout=timeout)
 
 
 def parse_get_status(data: bytes) -> dict:

@@ -16,6 +16,7 @@ mks_console.py — интерактивная консоль для управл
     status                    — GET_STATUS (разбор 7 байт)
     setphy <ch> <dr> <plen> <code> <prf> <pac>
                               — SET_PHY_CONFIG
+    txpower <level>           — SET_TX_POWER (мощность TX: больше level = мощнее)
     mode3                     — то же, что setphy 2 0 1024 9 64 32 (EVK Mode 3)
     rxstart                   — RX_START (включить непрерывный приём)
     rxstop                    — RX_STOP  (выключить приём)
@@ -46,6 +47,11 @@ HELP = """\
                                          SET_PHY_CONFIG (0x10)
                                          пример: setphy 2 0 1024 9 64 32
   mode3                                  = setphy 2 0 1024 9 64 32 (EVK Mode 3)
+  txpower <level>                        SET_TX_POWER (0x11) — мощность TX (вариант A)
+                                         level 0..223: БОЛЬШЕ level = БОЛЬШЕ мощность
+                                         (0 ≈ минимум, 223 ≈ максимум; шаг ≈ 0.5 dB)
+                                         пример: txpower 223 ; txpower 120
+                                         (требует предварительного mode3/setphy)
   rxstart                                RX_START (0x30) — включить приём
   rxstop                                 RX_STOP  (0x31) — выключить приём
   txframe <b0> <b1> ...                  TX_FRAME (0x20) — послать кадр (payload hex)
@@ -129,6 +135,31 @@ def cmd_metrics(dev, args, show_hex):
             print(f"    (разбор не удался: {e})")
     elif st == 0x06:  # TIMEOUT
         print("    (кадр ещё не принят — valid=0; жди пакет EVK и повтори metrics)")
+
+
+def cmd_txpower(dev, args, show_hex):
+    if not args:
+        print("  использование: txpower <level>   (0..223; больше level = мощнее, 223 ≈ максимум)")
+        print("  пример: txpower 223    (макс. мощность)")
+        return
+    try:
+        level = int(args[0])
+    except ValueError:
+        print("  ошибка: level должен быть целым (0..223)")
+        return
+    if not (0 <= level <= 0xFF):
+        print("  ошибка: level вне диапазона u8 (0..255); прошивка примет 0..223)")
+        return
+    st, data = dev.set_tx_power(level)
+    show_response(st, data, show_hex)
+    if st == 0x00:
+        if len(data) == 4:
+            power = int.from_bytes(data, "little")
+            octet = 0xFF - level
+            print(f"    применено: level={level}  power=0x{power:08X}  "
+                  f"(октет 0x{octet:02X} ×4)")
+        else:
+            print(f"    применено: level={level}")
 
 
 def cmd_txframe(dev, args, show_hex):
@@ -232,6 +263,8 @@ def main():
                     cmd_setphy(dev, cargs, show_hex)
                 elif cmd == "mode3":
                     cmd_setphy(dev, ["2", "0", "1024", "9", "64", "32"], show_hex)
+                elif cmd == "txpower":
+                    cmd_txpower(dev, cargs, show_hex)
                 elif cmd == "rxstart":
                     show_response(*dev.rx_start(), show_hex)
                 elif cmd == "rxstop":
