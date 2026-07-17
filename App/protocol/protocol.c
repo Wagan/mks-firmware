@@ -665,9 +665,13 @@ static ResponseStatus HandleGET_SIGNAL_METRICS(const uint8_t* params, uint8_t pa
 #define TX_FRAME_MAX    125
 #define TX_WAIT_GUARD   100000u
 
-/* Верхняя граница power_level для SET_TX_POWER (0x11). octet = 0xFF - level;
- * ограничиваем так, чтобы coarse-gain (биты 7:5) не опускался до 000 (особый
- * случай DA-off, UM §7.2.31.1): нижний октет не ниже 0x20 → level <= 0xDF. */
+/* Верхняя граница power_level для SET_TX_POWER (0x11). power_level задаёт мощность
+ * передатчика: БОЛЬШЕ level → БОЛЬШЕ мощность (0 ≈ минимум, POWER_LEVEL_MAX ≈
+ * максимум). Реализация: octet = 0xFF - level, поэтому рост level уменьшает
+ * аттенюацию DA/mixer (октет убывает) → мощность растёт. Верхняя граница 0xDF
+ * оставлена, чтобы coarse-код (биты 7:5) не опускался ниже 001 (октет не ниже
+ * 0x20; DA-off 000 — особый случай UM §7.2.31.1). Проверено на железе (loopback
+ * M1→M2): RX_LEVEL монотонно растёт с level. */
 #define POWER_LEVEL_MAX  0xDF
 
 /* Нижняя граница периода TX_PERIODIC (мс). Защита от «шторма»: эфирное время
@@ -764,8 +768,9 @@ static ResponseStatus HandleTX_PERIODIC(const uint8_t* params, uint8_t params_le
 
 /**
  * @brief SET_TX_POWER (0x11). Ручная регулировка мощности передатчика (вариант A).
- *        Параметры (wire): power_level u8 — число 0.5-dB шагов ослабления от макс.
- *        octet = 0xFF - level, дублируется во все 4 октета регистра TX_POWER.
+ *        Параметры (wire): power_level u8 — БОЛЬШЕ level → БОЛЬШЕ мощность
+ *        (0 ≈ мин, 0xDF ≈ макс), шаг ≈ 0.5 dB. Реализация: octet = 0xFF - level,
+ *        дублируется во все 4 октета регистра TX_POWER.
  *        Включает ручной режим (dwt_setsmarttxpower(0), DIS_STXP=1), затем
  *        dwt_configuretxrf. PGdly — по текущему каналу (TC_PGDELAY_CH*).
  *        Применяется на DW_TX_SOURCE_DEV. ТРЕБУЕТ предварительного SET_PHY_CONFIG
@@ -789,6 +794,7 @@ static ResponseStatus HandleSET_TX_POWER(const uint8_t* params, uint8_t params_l
     if (deca_port_select_device(DW_TX_SOURCE_DEV) != DWT_SUCCESS)
         return STATUS_RADIO_ERROR;
 
+    /* Инвертируем: больше level → меньше октет → меньше аттенюация → больше мощность. */
     uint8_t o = (uint8_t)(0xFF - level);
     dwt_txconfig_t cfg;
     cfg.PGdly = pgdly;
