@@ -18,6 +18,10 @@ GET_SIGNAL_METRICS(0x40) + parse_signal_metrics() под ИНТЕРИМ-форм
 (сырые поля dwt_rxdiag_t, 18 байт, 9x u16 LE, PROTOCOL_SPEC §8).
 RSSI/SNR по формулам DW1000 UM §4.7 — отдельным шагом позже (нужен
 RXPACC_NOSAT, которого в интерим-формате нет).
+
+v3 (2026-07-17): добавлен TX_PERIODIC(0x21) — периодическая передача кадра
+(PARAMS = period_ms u16 LE + length u16 LE + payload). Останов — существующим
+TX_STOP(0x22), который теперь снимает и периодику.
 """
 
 from __future__ import annotations
@@ -33,6 +37,7 @@ CMD_RESET_RADIO        = 0x03
 CMD_SET_PHY_CONFIG     = 0x10
 CMD_SET_TX_POWER       = 0x11
 CMD_TX_FRAME           = 0x20
+CMD_TX_PERIODIC        = 0x21
 CMD_TX_STOP            = 0x22
 CMD_RX_START           = 0x30
 CMD_RX_STOP            = 0x31
@@ -176,6 +181,20 @@ class MKS:
             raise ValueError("payload слишком длинный")
         params = struct.pack("<H", len(payload)) + payload
         return self.command(CMD_TX_FRAME, params, timeout=timeout)
+
+    def tx_periodic(self, period_ms: int, payload: bytes, timeout=None):
+        """TX_PERIODIC (0x21): периодически слать один и тот же кадр.
+        PARAMS = period_ms u16 LE + length u16 LE + payload.
+        period_ms — период между посылками (мс; прошивка требует >= 5).
+        length — число байт payload (без FCS; DW1000 добавит FCS сам).
+        Команда лишь ВЗВОДИТ режим и сразу возвращает OK; реальная посылка
+        идёт в main loop прошивки. Останов — tx_stop()."""
+        if not (0 <= period_ms <= 0xFFFF):
+            raise ValueError("period_ms вне диапазона u16")
+        if len(payload) > 0xFFFF:
+            raise ValueError("payload слишком длинный")
+        params = struct.pack("<HH", period_ms, len(payload)) + payload
+        return self.command(CMD_TX_PERIODIC, params, timeout=timeout)
 
     def tx_stop(self, timeout=None):
         return self.command(CMD_TX_STOP, timeout=timeout)

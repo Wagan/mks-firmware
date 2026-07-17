@@ -20,6 +20,7 @@ mks_console.py — интерактивная консоль для управл
     rxstart                   — RX_START (включить непрерывный приём)
     rxstop                    — RX_STOP  (выключить приём)
     txframe <b0> <b1> ...     — TX_FRAME (послать кадр, payload в hex)
+    txperiodic <T> <b0> ...   — TX_PERIODIC (период T мс + payload hex)
     txstop                    — TX_STOP
     metrics [prf]             — GET_SIGNAL_METRICS: сырьё + приближ. RSSI/FP_POWER
     raw <hex...>              — послать произвольные PARAMS к произвольному CMD:
@@ -49,7 +50,11 @@ HELP = """\
   rxstop                                 RX_STOP  (0x31) — выключить приём
   txframe <b0> <b1> ...                  TX_FRAME (0x20) — послать кадр (payload hex)
                                          пример: txframe DE AD BE EF 01
-  txstop                                 TX_STOP  (0x22)
+  txperiodic <T_ms> <b0> <b1> ...        TX_PERIODIC (0x21) — периодическая посылка
+                                         T_ms — период (мс, >= 5); payload в hex
+                                         пример: txperiodic 100 DE AD BE EF 01
+                                         останов: txstop
+  txstop                                 TX_STOP  (0x22) — стоп (в т.ч. периодики)
   metrics [prf]                          GET_SIGNAL_METRICS (0x40): сырьё +
                                          приближ. RSSI/FP_POWER (dBm, UM §4.7).
                                          prf = 16 или 64 (по умолч. 64, Mode 3)
@@ -142,6 +147,28 @@ def cmd_txframe(dev, args, show_hex):
         print(f"    кадр отправлен ({len(payload)} байт payload + авто-FCS)")
 
 
+def cmd_txperiodic(dev, args, show_hex):
+    if len(args) < 2:
+        print("  использование: txperiodic <T_ms> <b0> <b1> ...  (период мс, payload hex)")
+        print("  пример: txperiodic 100 DE AD BE EF 01")
+        return
+    try:
+        period_ms = int(args[0])
+    except ValueError:
+        print("  ошибка: период (первый аргумент) должен быть целым числом мс (напр. 100)")
+        return
+    try:
+        payload = bytes(int(a, 16) for a in args[1:])
+    except ValueError:
+        print("  ошибка: все байты payload должны быть hex (напр. DE AD BE EF)")
+        return
+    st, data = dev.tx_periodic(period_ms, payload)
+    show_response(st, data, show_hex)
+    if st == 0x00:
+        print(f"    периодика включена: период {period_ms} мс, "
+              f"{len(payload)} байт payload (+ авто-FCS). Останов: txstop")
+
+
 def cmd_raw(dev, args, show_hex):
     if not args:
         print("  использование: raw <cmd_id> [b0 b1 ...]  (всё в hex)")
@@ -213,6 +240,8 @@ def main():
                     cmd_metrics(dev, cargs, show_hex)
                 elif cmd == "txframe":
                     cmd_txframe(dev, cargs, show_hex)
+                elif cmd == "txperiodic":
+                    cmd_txperiodic(dev, cargs, show_hex)
                 elif cmd == "txstop":
                     show_response(*dev.tx_stop(), show_hex)
                 elif cmd == "raw":
