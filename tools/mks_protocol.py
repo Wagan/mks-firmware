@@ -265,9 +265,12 @@ class MKS:
 
 
 def parse_get_status(data: bytes) -> dict:
-    if len(data) != 7:
-        raise ProtocolError(f"GET_STATUS: ожидалось 7 байт, получено {len(data)}")
-    return {
+    """Разобрать DATA GET_STATUS. Первые 7 байт — прежний формат; при наличии
+    расширения (>=9 байт) добавляются live_count, live_mask и dev_ids (по модулю,
+    u32 LE, hex-строки). Терпимо к длине >=7 (старая прошивка = 7 байт)."""
+    if len(data) < 7:
+        raise ProtocolError(f"GET_STATUS: ожидалось >=7 байт, получено {len(data)}")
+    m = {
         "TX_state": data[0],
         "RX_state": data[1],
         "channel": data[2],
@@ -275,6 +278,16 @@ def parse_get_status(data: bytes) -> dict:
         "preamble_length": struct.unpack_from("<H", data, 4)[0],
         "PRF": data[6],
     }
+    if len(data) >= 9:                       # расширение: живость модулей
+        m["live_count"] = data[7]
+        m["live_mask"] = f"0x{data[8]:02X}"
+        dev_ids = []
+        off = 9
+        while off + 4 <= len(data):
+            dev_ids.append(f"0x{struct.unpack_from('<I', data, off)[0]:08X}")
+            off += 4
+        m["dev_ids"] = dev_ids
+    return m
 
 
 # Порядок полей ИНТЕРИМ-формата GET_SIGNAL_METRICS (PROTOCOL_SPEC §8):

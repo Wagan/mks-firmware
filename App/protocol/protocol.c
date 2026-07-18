@@ -428,66 +428,109 @@ static ResponseStatus HandlePING(const uint8_t* params, uint8_t params_len,
 }
 
 /**
- * @brief INIT (0x01). Инициализация всех модулей: аппаратный сброс, медленный
- *        SPI, dwt_initialise() с загрузкой LDE-микрокода. Результат — в кэш.
- *        Возвращает STATUS_OK только если инициализированы ВСЕ модули.
+ * @brief INIT (0x01). Обнаруживает ЖИВЫЕ модули по DEV_ID и инициализирует их
+ *        (аппаратный сброс, медленный SPI, dwt_initialise() с загрузкой LDE).
+ *        Отсутствующий/немой модуль (dev_id != DWT_DEVICE_ID) пропускается — НЕ
+ *        роняет общий статус. STATUS_OK, если жив ≥1 модуль (DATA: live_count u8,
+ *        live_mask u8; бит i = модуль i живой); RADIO_ERROR, если живых нет.
+ *        Обобщён под DW_DEVICE_COUNT (заработает и на 5-канальном макете).
  */
 static ResponseStatus HandleINIT(const uint8_t* params, uint8_t params_len,
                                  uint8_t** out_data, uint8_t* out_len)
 {
-    (void)params; (void)params_len; (void)out_data;
+    (void)params; (void)params_len;
     *out_len = 0;
 
-    ResponseStatus status = STATUS_OK;
+    uint8_t live_count = 0;
+    uint8_t live_mask  = 0;
 
     for (int i = 0; i < DW_DEVICE_COUNT; i++) {
         dw_dev_state[i].initialized = 0;
         dw_dev_state[i].dev_id      = 0;
 
         if (deca_port_select_device(i) != DWT_SUCCESS) {
-            status = STATUS_RADIO_ERROR;
-            continue;
+            continue;                 /* место недоступно — не живой, без общей ошибки */
         }
 
         deca_port_hard_reset(i);      /* аппаратный сброс именно этого модуля */
         deca_port_spi_set_slow();     /* init требует SPI < 3 МГц */
 
+        /* Дешёвая проверка присутствия ДО тяжёлого dwt_initialise: отсекает
+         * отсутствующий модуль по dev_id (критерий как в vendor). Ускоряет INIT
+         * на неполной плате (не ждём таймаутов initialise на мёртвом модуле). */
+        uint32_t id = dwt_readdevid();
+        if (id != DWT_DEVICE_ID) {
+            continue;                 /* модуля нет / не отвечает */
+        }
+
         if (dwt_initialise(DWT_LOADUCODE) != DWT_SUCCESS) {
-            status = STATUS_RADIO_ERROR;
-            continue;
+            continue;                 /* присутствует, но init не удался (редко) */
         }
 
         dw_dev_state[i].initialized = 1;
-        dw_dev_state[i].dev_id      = dwt_readdevid();
+        dw_dev_state[i].dev_id      = id;
+        live_count++;
+        live_mask |= (uint8_t)(1u << i);
         /* PHY-поля (channel/data_rate/...) заполнит будущий SET_PHY_CONFIG. */
     }
 
-    return status;
+    if (live_count == 0) {
+        return STATUS_RADIO_ERROR;    /* нет ни одного живого модуля */
+    }
+
+    static uint8_t data[2];
+    data[0] = live_count;
+    data[1] = live_mask;
+    *out_data = data;
+    *out_len  = 2;
+    return STATUS_OK;
 }
 
 /**
  * @brief GET_STATUS (0x02). Отдаёт кэш состояния (без обращения к чипу).
- *        DATA: TX_state u8, RX_state u8, channel u8, data_rate u8,
- *              preamble_length u16 (LE), PRF u8  — итого 7 байт (API v1.3).
- *        Пока рапортуем по модулю M1 (индекс 0); мультимодульный статус — TBD.
+ *        Первые 7 байт (прежний формат, байт-в-байт): TX_state u8, RX_state u8,
+ *        channel u8, data_rate u8, preamble_length u16 LE, PRF u8 (по модулю M1).
+ *        Расширение (аддитивно, в конце): live_count u8, live_mask u8, затем
+ *        dev_id[i] u32 LE по каждому модулю (0 если не живой). Итог для 2 модулей —
+ *        17 байт. Старый хост читает первые 7 и не ломается.
  */
 static ResponseStatus HandleGET_STATUS(const uint8_t* params, uint8_t params_len,
                                        uint8_t** out_data, uint8_t* out_len)
 {
     (void)params; (void)params_len;
-    static uint8_t data[7];
+    static uint8_t data[7 + 2 + DW_DEVICE_COUNT * 4];
     const dw_dev_state_t* s = &dw_dev_state[DW_DEV_M1];
+    uint8_t* p = data;
 
-    data[0] = 0;                              /* TX_state (трекинга пока нет) */
-    data[1] = 0;                              /* RX_state (трекинга пока нет) */
-    data[2] = s->channel;
-    data[3] = s->data_rate;
-    data[4] = s->preamble_len & 0xFF;
-    data[5] = (s->preamble_len >> 8) & 0xFF;
-    data[6] = s->prf;
+    /* Первые 7 байт — прежний формат (не менять порядок/источник). */
+    *p++ = 0;                              /* TX_state (трекинга пока нет) */
+    *p++ = 0;                              /* RX_state (трекинга пока нет) */
+    *p++ = s->channel;
+    *p++ = s->data_rate;
+    *p++ = (uint8_t)(s->preamble_len & 0xFF);
+    *p++ = (uint8_t)((s->preamble_len >> 8) & 0xFF);
+    *p++ = s->prf;
+
+    /* Расширение: живость модулей + их DEV_ID. */
+    uint8_t live_count = 0, live_mask = 0;
+    for (int i = 0; i < DW_DEVICE_COUNT; i++) {
+        if (dw_dev_state[i].initialized) {
+            live_count++;
+            live_mask |= (uint8_t)(1u << i);
+        }
+    }
+    *p++ = live_count;
+    *p++ = live_mask;
+    for (int i = 0; i < DW_DEVICE_COUNT; i++) {
+        uint32_t id = dw_dev_state[i].dev_id;
+        *p++ = (uint8_t)(id & 0xFF);
+        *p++ = (uint8_t)((id >> 8) & 0xFF);
+        *p++ = (uint8_t)((id >> 16) & 0xFF);
+        *p++ = (uint8_t)((id >> 24) & 0xFF);
+    }
 
     *out_data = data;
-    *out_len  = 7;
+    *out_len  = (uint8_t)(p - data);
     return STATUS_OK;
 }
 
@@ -619,10 +662,12 @@ static ResponseStatus HandleSET_PHY_CONFIG(const uint8_t* params, uint8_t params
     cfg.phrMode = DWT_PHRMODE_STD;
     cfg.sfdTO   = 0;   /* 0 → драйвер подставит DWT_SFDTOC_DEF (deca_device.c) */
 
-    /* Применяем на все модули. Требуется предварительный INIT (dwt_configure
-     * опирается на состояние, установленное dwt_initialise). */
+    /* Применяем на все ЖИВЫЕ модули (dwt_configure опирается на состояние от
+     * dwt_initialise). Мёртвые/неинициализированные — пропускаем, чтобы неполная
+     * плата (напр. только M2) конфигурировалась, а не падала из-за отсутствующего. */
+    int configured = 0;
     for (int i = 0; i < DW_DEVICE_COUNT; i++) {
-        if (!dw_dev_state[i].initialized) return STATUS_RADIO_ERROR;
+        if (!dw_dev_state[i].initialized) continue;
 
         if (deca_port_select_device(i) != DWT_SUCCESS) return STATUS_RADIO_ERROR;
         dwt_configure(&cfg);   /* void: валидация уже сделана ДО вызова */
@@ -631,8 +676,10 @@ static ResponseStatus HandleSET_PHY_CONFIG(const uint8_t* params, uint8_t params
         dw_dev_state[i].data_rate    = data_rate;
         dw_dev_state[i].preamble_len = plen_raw;
         dw_dev_state[i].prf          = prf_raw;
+        configured++;
     }
 
+    if (configured == 0) return STATUS_RADIO_ERROR;   /* нет живых модулей (нет INIT) */
     return STATUS_OK;
 }
 
@@ -667,6 +714,7 @@ static ResponseStatus HandleRX_STOP(const uint8_t* params, uint8_t params_len,
     (void)params; (void)params_len; (void)out_data;
     *out_len = 0;
 
+    if (!dw_dev_state[DW_RX_LISTEN_DEV].initialized) return STATUS_RADIO_ERROR;
     if (deca_port_select_device(DW_RX_LISTEN_DEV) != DWT_SUCCESS) return STATUS_RADIO_ERROR;
     dwt_forcetrxoff();
     rx_active = 0;
@@ -967,6 +1015,7 @@ static ResponseStatus HandleTX_STOP(const uint8_t* params, uint8_t params_len,
     *out_len = 0;
 
     tx_periodic_active = 0;   /* остановить периодику (если была) — единая точка останова */
+    if (!dw_dev_state[DW_TX_SOURCE_DEV].initialized) return STATUS_RADIO_ERROR;
     if (deca_port_select_device(DW_TX_SOURCE_DEV) != DWT_SUCCESS) return STATUS_RADIO_ERROR;
     dwt_forcetrxoff();
     return STATUS_OK;
