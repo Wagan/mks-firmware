@@ -478,6 +478,8 @@ static ResponseStatus HandleINIT(const uint8_t* params, uint8_t params_len,
      * (иначе GET_CIR/GET_SIGNAL_METRICS отдали бы старые данные до нового приёма). */
     cir_snap.valid   = 0;
     rx_metrics.valid = 0;
+    stream_active    = 0;   /* страховка: гарантированно выйти из потокового режима
+                             * (если предыдущее приложение упало с включённым потоком) */
 
     if (live_count == 0) {
         return STATUS_RADIO_ERROR;    /* нет ни одного живого модуля */
