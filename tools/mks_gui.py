@@ -6,22 +6,36 @@
 
   Файл:     mks_gui.py
   Описание: исследовательский GUI «МКС для MATLAB» (tkinter + matplotlib).
-            Вкладки Монитор/Настройки/Водопад, потоковый приём, сохраняемые
-            сценарии старта, запись из потока в CSV. Поверх mks_protocol.py.
+            Замороженная инфо-панель (управление + телеметрия, всегда видна) над
+            вкладками Монитор/Водопад/Настройки; потоковый приём, передатчик M1
+            (loopback), сохраняемые сценарии старта, запись из потока в CSV.
+            Поверх mks_protocol.py.
 
   Copyright (c) 2026 NCPR, Flexlab LLC. Все права защищены.
 *******************************************************************************
 
-mks_gui.py — GUI поверх готовой библиотеки. Шаг 2: вкладки + сценарии старта.
+mks_gui.py — GUI поверх готовой библиотеки.
 
-Вкладки:
-  Монитор  — график CIR, кружок-индикатор, телеметрия, кнопки Старт/Стоп, запись.
-  Настройки— подключение, выбор PHY-режима, content, сценарий старта, настройки записи.
-  Водопад  — заглушка (рендер — Шаг 3; буфер CIR уже копится).
+Компоновка (Шаг 4):
+  [ Заголовок ]
+  [ ЗАМОРОЖЕННАЯ ПАНЕЛЬ (всегда видна): Включить/Старт/Стоп/Пуск TX/Стоп TX,
+    кружок «приём», телеметрия из потока ]
+  [ Notebook: Монитор (график CIR + запись) | Водопад | Настройки ]
 
-Движок Шага 1 сохранён: потоковый приём (SET_STREAM_MODE), фоновое чтение
+Движок Шагов 1–3 сохранён: потоковый приём (SET_STREAM_MODE), фоновое чтение
 (mks_stream.StreamReader), кружок/гашение по таймауту, прорежённый рендер при записи
-ВСЕХ кадров, буфер водопада (deque), страховки от залипшего потока.
+ВСЕХ кадров, буфер водопада (deque), выравнивание по абсолютному sample_index,
+три страховки от залипшего потока.
+
+Новое (Шаг 4):
+  - управление и телеметрия вынесены в постоянную панель над вкладками;
+  - подключение COM — кнопка «Включить/Выключить» на панели (поле порта — в Настройках);
+  - передатчик M1: кнопки «Пуск TX/Стоп TX» + команда txperiodic в сценарии
+    (self-contained loopback M1->M2 без внешних источников);
+  - водопад фиксированной глубины (поле «Глубина водопада» в Настройках).
+
+TX во время активного потока исполняется В САМОМ потоковом треде (единый владелец
+COM-порта — pyserial не потокобезопасен для конкурентного чтения).
 
 Запуск:
     python mks_gui.py            # порт вводится в окне
@@ -51,7 +65,7 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 import mks_protocol as mks
 from mks_stream import StreamReader, parse_stream_body
 
-GUI_VERSION = "2"
+GUI_VERSION = "3"
 APP_TITLE = "МКС для MATLAB. © 2026 Flexlab | Progresstech"
 
 PHY_MODES = {
@@ -71,17 +85,23 @@ PRESENCE_WINDOW_S = 1.0
 PUMP_MS           = 60
 REC_FLUSH_EVERY   = 50
 WATERFALL_MAXLEN  = 500
+WATERFALL_DEPTH   = 120     # глубина отображения водопада по умолчанию (кадров)
 WF_PERIOD_S       = 0.15    # перерисовка водопада (~6/с; imshow тяжелее линии), только на активной вкладке
 WF_CMAP           = "turbo"
+
+DEFAULT_TX_PERIOD    = 20                 # мс (прошивка требует >= 5)
+DEFAULT_TX_PAYLOAD   = "DE AD BE EF 01"   # payload TX по умолчанию (hex)
 
 METRICS_HEADER = ["frame_id", "timestamp", "count", "frames_per_sec", "RXPACC",
                   "RXPACC_NOSAT", "N_corrected", "CIR_PWR", "STD_NOISE", "FP_INDEX",
                   "RSSI_dBm", "FP_POWER_dBm", "SNR_dB", "mode"]
 CIR_HEADER = ["frame_id", "sample_index", "I", "Q", "amplitude"]
 
-# Минимальный безопасный набор команд сценария старта: имя -> число аргументов.
+# Минимальный безопасный набор команд сценария старта.
+#   число  -> ровно столько целочисленных аргументов;
+#   None   -> переменное число (спец-разбор, см. parse_scenario: txperiodic).
 SCENARIO_CMDS = {"init": 0, "setphy": 6, "mode": 1, "rxstart": 0, "rxstop": 0,
-                 "stream": 1, "txstop": 0}
+                 "stream": 1, "txstop": 0, "txperiodic": None}
 
 
 def phy_by_mode_num(n: int) -> dict:
@@ -92,11 +112,30 @@ def phy_by_mode_num(n: int) -> dict:
     raise ValueError(f"Mode {n} не найден")
 
 
+def parse_hex_payload(s: str) -> bytes:
+    """Разобрать payload из hex-токенов (пробелы/запятые), напр. 'DE AD BE EF 01'.
+    Каждый токен — байт 0..FF. Пустая строка → ValueError."""
+    toks = s.replace(",", " ").split()
+    if not toks:
+        raise ValueError("пустой payload")
+    out = []
+    for t in toks:
+        try:
+            b = int(t, 16)
+        except ValueError:
+            raise ValueError(f"'{t}' не hex-байт")
+        if not (0 <= b <= 0xFF):
+            raise ValueError(f"'{t}' вне диапазона 0..FF")
+        out.append(b)
+    return bytes(out)
+
+
 def parse_scenario(text: str) -> list:
-    """Разобрать текст сценария старта → список (cmd, [int-аргументы]).
+    """Разобрать текст сценария старта → список (cmd, args).
     Формат: одна команда на строку, '#' — комментарий, пустые строки игнорируются.
-    Поддержаны только команды SCENARIO_CMDS; иначе / при неверных аргументах —
-    ValueError с номером строки. Пустой сценарий → ValueError."""
+    Для большинства команд args = [int...]; для txperiodic args = [period:int,
+    payload:bytes]. Поддержаны только команды SCENARIO_CMDS; иначе / при неверных
+    аргументах — ValueError с номером строки. Пустой сценарий → ValueError."""
     steps = []
     for lineno, raw in enumerate(text.splitlines(), 1):
         line = raw.split("#", 1)[0].strip()
@@ -106,6 +145,25 @@ def parse_scenario(text: str) -> list:
         cmd, args = parts[0].lower(), parts[1:]
         if cmd not in SCENARIO_CMDS:
             raise ValueError(f"строка {lineno}: неизвестная команда '{cmd}'")
+
+        if cmd == "txperiodic":
+            # txperiodic <период_мс> [payload hex...]; payload опционален (деф.).
+            if len(args) < 1:
+                raise ValueError(f"строка {lineno}: txperiodic ожидает период [payload hex...]")
+            try:
+                period = int(args[0])
+            except ValueError:
+                raise ValueError(f"строка {lineno}: txperiodic период — целое (мс)")
+            if period < 5:
+                raise ValueError(f"строка {lineno}: txperiodic период должен быть >= 5")
+            try:
+                payload = (parse_hex_payload(" ".join(args[1:])) if args[1:]
+                           else parse_hex_payload(DEFAULT_TX_PAYLOAD))
+            except ValueError as e:
+                raise ValueError(f"строка {lineno}: txperiodic payload — {e}")
+            steps.append((cmd, [period, payload]))
+            continue
+
         need = SCENARIO_CMDS[cmd]
         if len(args) != need:
             raise ValueError(f"строка {lineno}: '{cmd}' ожидает {need} арг., получено {len(args)}")
@@ -126,7 +184,9 @@ def parse_scenario(text: str) -> list:
 
 
 def default_scenario(phy: dict, mode_label: str, content: int) -> str:
-    """Сгенерировать дефолтный сценарий из выбранного режима и content."""
+    """Сгенерировать дефолтный сценарий из выбранного режима и content.
+    БЕЗ txperiodic — по умолчанию только слушаем (внешний источник: киты/плата2).
+    Для self-contained loopback добавьте строку txperiodic вручную."""
     return (
         f"# авто-сценарий: {mode_label}, content={content}\n"
         f"init\n"
@@ -134,17 +194,23 @@ def default_scenario(phy: dict, mode_label: str, content: int) -> str:
         f"{phy['prf']} {phy['pac']}   # {mode_label}\n"
         f"rxstart\n"
         f"stream {content}\n"
+        f"# для loopback M1->M2 раскомментируйте (M1 будет передавать):\n"
+        f"# txperiodic {DEFAULT_TX_PERIOD} {DEFAULT_TX_PAYLOAD}\n"
     )
 
 
-def build_waterfall_matrix(frames):
+def build_waterfall_matrix(frames, depth=None):
     """Собрать матрицу водопада из CIR-кадров (вариант А — по АБСОЛЮТНОМУ
     sample_index; пустые ячейки = NaN, честно отражает дрожание FP по X).
 
     frames — последовательность cir-dict (start_index, amps), новейший ПОСЛЕДНИМ.
+    depth  — если задан (>0), берутся только последние depth кадров (фикс. глубина
+             водопада: высота матрицы <= depth, картинка «течёт» с постоянной высотой).
     Возвращает (matrix, x_min, x_max): row 0 = НОВЕЙШИЙ кадр (для origin='upper',
     водопад течёт вниз). Если данных нет — (None, 0, 0)."""
     frames = [f for f in frames if f and f.get("amps")]
+    if depth is not None and depth > 0:
+        frames = frames[-depth:]
     if not frames:
         return None, 0, 0
     x_min = min(f["start_index"] for f in frames)
@@ -180,6 +246,12 @@ class MKSGui:
         self._stream_host_lost = 0
         self._stream_dropped = 0
 
+        # Передатчик M1 (loopback).
+        self.tx_active = False
+        self._tx_pending = False
+        self._stream_cmd_lock = threading.Lock()
+        self._stream_cmd = None           # ('txperiodic', period, payload) | ('txstop',)
+
         self.waterfall = collections.deque(maxlen=WATERFALL_MAXLEN)
 
         self.rec_lock = threading.Lock()
@@ -201,13 +273,16 @@ class MKSGui:
     # ------------------------------------------------------------------ UI --
     def _build_ui(self, default_port: str):
         self.root.columnconfigure(0, weight=1)
-        self.root.rowconfigure(1, weight=1)
+        self.root.rowconfigure(2, weight=1)          # растёт Notebook (row 2)
 
         ttk.Label(self.root, text=APP_TITLE, font=("Segoe UI", 12, "bold")).grid(
             row=0, column=0, sticky="w", padx=8, pady=(6, 0))
 
+        # Замороженная инфо-панель (всегда видна над вкладками).
+        self._build_panel(self.root)
+
         self.nb = ttk.Notebook(self.root)
-        self.nb.grid(row=1, column=0, sticky="nsew", padx=6, pady=4)
+        self.nb.grid(row=2, column=0, sticky="nsew", padx=6, pady=4)
 
         self.tab_mon = ttk.Frame(self.nb)
         self.tab_wf = ttk.Frame(self.nb)
@@ -222,46 +297,66 @@ class MKSGui:
         # bind ПОСЛЕ построения вкладок — иначе ранний TabChanged дёрнет пустой водопад
         self.nb.bind("<<NotebookTabChanged>>", self._on_tab_changed)
 
-        self.status = tk.StringVar(value="Готово. Настройки → Подключить.")
+        self.status = tk.StringVar(value="Готово. Введите порт в «Настройки», затем «Включить».")
         ttk.Label(self.root, textvariable=self.status, relief="sunken",
-                  anchor="w").grid(row=2, column=0, sticky="ew", padx=6, pady=(0, 6))
+                  anchor="w").grid(row=3, column=0, sticky="ew", padx=6, pady=(0, 6))
 
-    def _build_monitor(self, tab):
+    def _build_panel(self, parent):
         pad = dict(padx=4, pady=3)
-        tab.columnconfigure(0, weight=1)
-        tab.rowconfigure(2, weight=1)
+        panel = ttk.LabelFrame(parent, text="Управление и телеметрия")
+        panel.grid(row=1, column=0, sticky="ew", padx=6, pady=(4, 0))
+        panel.columnconfigure(0, weight=1)
 
-        top = ttk.Frame(tab)
-        top.grid(row=0, column=0, sticky="ew", padx=4, pady=2)
-        top.columnconfigure(0, weight=1)
-        self.btn_start = ttk.Button(top, text="Старт", command=self.on_start)
-        self.btn_start.grid(row=0, column=0, sticky="w", **pad)
-        self.btn_stop = ttk.Button(top, text="Стоп", command=self.on_stop)
-        self.btn_stop.grid(row=0, column=1, sticky="w", **pad)
-        ttk.Label(top, text="приём:").grid(row=0, column=2, sticky="e")
-        self.circle = tk.Canvas(top, width=26, height=26, highlightthickness=0)
-        self._circle_id = self.circle.create_oval(3, 3, 23, 23, fill="#3a3a3a", outline="")
-        self.circle.grid(row=0, column=3, sticky="e", padx=4)
+        # Ряд кнопок.
+        btns = ttk.Frame(panel)
+        btns.grid(row=0, column=0, sticky="ew", padx=2, pady=2)
+        self.btn_connect = ttk.Button(btns, text="Включить", command=self.on_connect)
+        self.btn_connect.pack(side="left", padx=3)
+        ttk.Separator(btns, orient="vertical").pack(side="left", fill="y", padx=6)
+        self.btn_start = ttk.Button(btns, text="Старт", command=self.on_start)
+        self.btn_start.pack(side="left", padx=3)
+        self.btn_stop = ttk.Button(btns, text="Стоп", command=self.on_stop)
+        self.btn_stop.pack(side="left", padx=3)
+        ttk.Separator(btns, orient="vertical").pack(side="left", fill="y", padx=6)
+        self.btn_tx = ttk.Button(btns, text="Пуск TX", command=self.on_tx_start)
+        self.btn_tx.pack(side="left", padx=3)
+        self.btn_tx_stop = ttk.Button(btns, text="Стоп TX", command=self.on_tx_stop)
+        self.btn_tx_stop.pack(side="left", padx=3)
+        self.tx_lbl = ttk.Label(btns, text="TX: стоп", foreground="gray")
+        self.tx_lbl.pack(side="left", padx=6)
 
-        tel = ttk.LabelFrame(tab, text="Телеметрия (из потока)")
-        tel.grid(row=1, column=0, sticky="ew", padx=4, pady=2)
+        # Связь + кружок (справа).
+        self.conn_status = ttk.Label(btns, text="не подключено", foreground="gray")
+        self.conn_status.pack(side="right", padx=6)
+        self.circle = tk.Canvas(btns, width=24, height=24, highlightthickness=0)
+        self._circle_id = self.circle.create_oval(3, 3, 21, 21, fill="#3a3a3a", outline="")
+        self.circle.pack(side="right")
+        ttk.Label(btns, text="приём:").pack(side="right", padx=(0, 2))
+
+        # Телеметрия (всегда видна).
+        tel = ttk.Frame(panel)
+        tel.grid(row=1, column=0, sticky="ew", padx=2, pady=(0, 3))
         self.tel_vars = {}
-        rows = [("fps", "Кадров/с"), ("count", "Принято кадров"),
+        rows = [("fps", "Кадров/с"), ("count", "Принято"),
                 ("snr", "SNR, dB"), ("rssi", "RSSI, dBm"),
                 ("fp_power", "FP_POWER, dBm"), ("fp_index", "FP_INDEX"),
                 ("dropped", "DROPPED (fw)"), ("host_lost", "Потери хоста"),
                 ("mode", "Режим")]
+        percol = 5
         for i, (key, label) in enumerate(rows):
-            ttk.Label(tel, text=label + ":").grid(row=i // 3, column=(i % 3) * 2,
-                                                  sticky="e", **pad)
+            r, c = i // percol, (i % percol) * 2
+            ttk.Label(tel, text=label + ":").grid(row=r, column=c, sticky="e", **pad)
             v = tk.StringVar(value="—")
             self.tel_vars[key] = v
-            ttk.Label(tel, textvariable=v, width=16, anchor="w",
-                      font=("Consolas", 10)).grid(row=i // 3, column=(i % 3) * 2 + 1,
-                                                  sticky="w", **pad)
+            ttk.Label(tel, textvariable=v, width=13, anchor="w",
+                      font=("Consolas", 10)).grid(row=r, column=c + 1, sticky="w", **pad)
+
+    def _build_monitor(self, tab):
+        tab.columnconfigure(0, weight=1)
+        tab.rowconfigure(0, weight=1)
 
         plot = ttk.LabelFrame(tab, text="CIR (окно вокруг first path)")
-        plot.grid(row=2, column=0, sticky="nsew", padx=4, pady=2)
+        plot.grid(row=0, column=0, sticky="nsew", padx=4, pady=2)
         self.fig = Figure(figsize=(6, 3), dpi=100)
         self.ax = self.fig.add_subplot(111)
         self._reset_axes()
@@ -271,8 +366,9 @@ class MKSGui:
         pbot.pack(fill="x")
         ttk.Button(pbot, text="Сохранить PNG", command=self.on_save_png).pack(side="right", padx=4)
 
+        pad = dict(padx=4, pady=3)
         rec = ttk.LabelFrame(tab, text="Запись")
-        rec.grid(row=3, column=0, sticky="ew", padx=4, pady=2)
+        rec.grid(row=1, column=0, sticky="ew", padx=4, pady=2)
         self.btn_rec = ttk.Button(rec, text="Запись", command=self.on_start_record)
         self.btn_rec.grid(row=0, column=0, **pad)
         self.btn_rec_stop = ttk.Button(rec, text="Стоп записи", command=self.on_stop_record)
@@ -282,16 +378,13 @@ class MKSGui:
 
     def _build_settings(self, tab, default_port):
         pad = dict(padx=4, pady=3)
+        tab.columnconfigure(0, weight=1)
 
-        conn = ttk.LabelFrame(tab, text="Подключение")
+        conn = ttk.LabelFrame(tab, text="Подключение (кнопка Включить — на панели сверху)")
         conn.grid(row=0, column=0, sticky="ew", padx=6, pady=4)
         ttk.Label(conn, text="COM-порт:").grid(row=0, column=0, **pad)
         self.port_var = tk.StringVar(value=default_port or "COM3")
         ttk.Entry(conn, textvariable=self.port_var, width=12).grid(row=0, column=1, **pad)
-        self.btn_connect = ttk.Button(conn, text="Подключить", command=self.on_connect)
-        self.btn_connect.grid(row=0, column=2, **pad)
-        self.conn_status = ttk.Label(conn, text="не подключено", foreground="gray")
-        self.conn_status.grid(row=0, column=3, **pad)
 
         phy = ttk.LabelFrame(tab, text="PHY-режим и поток")
         phy.grid(row=1, column=0, sticky="ew", padx=6, pady=4)
@@ -322,10 +415,31 @@ class MKSGui:
         self.rb_c1.grid(row=2, column=1, sticky="w", **pad)
         self.rb_c2.grid(row=2, column=2, sticky="w", **pad)
 
-        scen = ttk.LabelFrame(tab, text="Сценарий старта (команды: init, setphy, mode N, rxstart, rxstop, stream N, txstop)")
-        scen.grid(row=2, column=0, sticky="nsew", padx=6, pady=4)
-        tab.rowconfigure(2, weight=1)
-        tab.columnconfigure(0, weight=1)
+        # Передатчик M1 (loopback) — параметры для кнопки «Пуск TX» и команды txperiodic.
+        txf = ttk.LabelFrame(tab, text="Передатчик M1 (loopback M1→M2)")
+        txf.grid(row=2, column=0, sticky="ew", padx=6, pady=4)
+        ttk.Label(txf, text="Период TX, мс:").grid(row=0, column=0, **pad)
+        self.tx_period_var = tk.StringVar(value=str(DEFAULT_TX_PERIOD))
+        ttk.Spinbox(txf, from_=5, to=1000, textvariable=self.tx_period_var,
+                    width=8).grid(row=0, column=1, **pad)
+        ttk.Label(txf, text="Payload TX (hex):").grid(row=0, column=2, **pad)
+        self.tx_payload_var = tk.StringVar(value=DEFAULT_TX_PAYLOAD)
+        ttk.Entry(txf, textvariable=self.tx_payload_var, width=24).grid(row=0, column=3, **pad)
+
+        # Водопад — фиксированная глубина отображения.
+        wff = ttk.LabelFrame(tab, text="Водопад")
+        wff.grid(row=3, column=0, sticky="ew", padx=6, pady=4)
+        ttk.Label(wff, text="Глубина (кадров):").grid(row=0, column=0, **pad)
+        self.wf_depth_var = tk.IntVar(value=WATERFALL_DEPTH)
+        ttk.Spinbox(wff, from_=20, to=WATERFALL_MAXLEN, textvariable=self.wf_depth_var,
+                    width=8).grid(row=0, column=1, **pad)
+        ttk.Label(wff, text=f"(20..{WATERFALL_MAXLEN}; постоянная высота, старые уходят снизу)",
+                  foreground="gray").grid(row=0, column=2, sticky="w", **pad)
+
+        scen = ttk.LabelFrame(tab, text="Сценарий старта (init, setphy, mode N, rxstart, "
+                                        "rxstop, stream N, txperiodic <мс> [hex...], txstop)")
+        scen.grid(row=4, column=0, sticky="nsew", padx=6, pady=4)
+        tab.rowconfigure(4, weight=1)
         btns = ttk.Frame(scen)
         btns.grid(row=0, column=0, sticky="ew")
         self.btn_scen_load = ttk.Button(btns, text="Загрузить…", command=self.on_scenario_load)
@@ -342,7 +456,7 @@ class MKSGui:
         scen.columnconfigure(0, weight=1)
 
         recset = ttk.LabelFrame(tab, text="Настройки записи")
-        recset.grid(row=3, column=0, sticky="ew", padx=6, pady=4)
+        recset.grid(row=5, column=0, sticky="ew", padx=6, pady=4)
         self.rec_mode_var = tk.StringVar(value="light")
         self.rb_light = ttk.Radiobutton(recset, text="Лёгкий (метрики)", value="light",
                                         variable=self.rec_mode_var)
@@ -378,10 +492,16 @@ class MKSGui:
         cfg_ok = connected and not self.detecting and not self.busy
         for child in self._manual_entries():
             child.configure(state=("normal" if (manual and cfg_ok) else "disabled"))
-        self.btn_connect.configure(text=("Отключить" if connected else "Подключить"),
+        self.btn_connect.configure(text=("Выключить" if connected else "Включить"),
                                    state=("disabled" if self.busy else "normal"))
         self.btn_start.configure(state=("normal" if cfg_ok else "disabled"))
         self.btn_stop.configure(state=("normal" if (connected and self.detecting) else "disabled"))
+        # Передатчик M1: доступен при подключении (до/во время потока), не в busy/pending.
+        tx_free = connected and not self.busy and not self._tx_pending
+        self.btn_tx.configure(state=("normal" if (tx_free and not self.tx_active) else "disabled"))
+        self.btn_tx_stop.configure(state=("normal" if (tx_free and self.tx_active) else "disabled"))
+        self.tx_lbl.configure(text=("TX: идёт" if self.tx_active else "TX: стоп"),
+                              foreground=("#c5221f" if self.tx_active else "gray"))
         # Конфиг (режим/content/сценарий) — только вне потока.
         st_cfg = "normal" if cfg_ok else "disabled"
         st_cfg_ro = "readonly" if cfg_ok else "disabled"
@@ -468,20 +588,27 @@ class MKSGui:
 
     # ------------------------------------------------------- обработчики --
     def on_connect(self):
-        if self.dev is not None:
-            self.on_stop()
+        if self.dev is not None:                 # --- Выключить ---
+            self.on_stop()                       # остановить поток (join reader-треда)
+            try:
+                if self.tx_active:               # §2: остановить TX при активности
+                    self.dev.tx_stop()
+            except Exception:
+                pass
             try:
                 self.dev.close()
             except Exception:
                 pass
             self.dev = None
+            self.tx_active = False
+            self._tx_pending = False
             self.conn_status.configure(text="не подключено", foreground="gray")
             self.status.set("Отключено.")
             self._refresh_controls()
             return
-        port = self.port_var.get().strip()
+        port = self.port_var.get().strip()       # --- Включить ---
         if not port:
-            messagebox.showwarning("Порт", "Укажите COM-порт (напр. COM3).")
+            messagebox.showwarning("Порт", "Укажите COM-порт в «Настройки» (напр. COM3).")
             return
 
         def do_connect():
@@ -496,6 +623,7 @@ class MKSGui:
 
         def ok(dev):
             self.dev = dev
+            self.tx_active = False
             self.conn_status.configure(text=f"подключено ({port})", foreground="green")
         self._run_async(f"Подключение к {port}", do_connect, ok)
 
@@ -533,22 +661,33 @@ class MKSGui:
 
     def _run_scenario(self, steps):
         stream_on = None
+        tx_started = False
         try:
             for cmd, iargs in steps:
                 st = self._exec_step(cmd, iargs)
-                self.q.put(("scen_log", f"{cmd} {' '.join(map(str, iargs))} → {mks.status_name(st)}"))
+                self.q.put(("scen_log", f"{self._fmt_step(cmd, iargs)} → {mks.status_name(st)}"))
                 if st != 0x00:
                     self.q.put(("scen_err", f"{cmd}: {mks.status_name(st)}"))
                     return
                 if cmd == "stream" and iargs[0] in (1, 2):
                     stream_on = iargs[0]
+                if cmd == "txperiodic":
+                    tx_started = True
         except Exception as e:
             self.q.put(("scen_err", str(e)))
             return
-        self.q.put(("scen_ok", stream_on))
+        self.q.put(("scen_ok", stream_on, tx_started))
+
+    @staticmethod
+    def _fmt_step(cmd, iargs):
+        parts = [cmd]
+        for a in iargs:
+            parts.append(a.hex(" ").upper() if isinstance(a, (bytes, bytearray)) else str(a))
+        return " ".join(parts)
 
     def _exec_step(self, cmd, iargs) -> int:
-        """Выполнить одну команду сценария → STATUS. Только SCENARIO_CMDS."""
+        """Выполнить одну команду сценария → STATUS. Только SCENARIO_CMDS.
+        Вызывается ДО старта потокового треда (порт свободен)."""
         d = self.dev
         if cmd == "init":
             st, _ = d.init(timeout=20.0)
@@ -568,6 +707,9 @@ class MKSGui:
             st, _ = d.rx_stop()
         elif cmd == "stream":
             st, _ = d.set_stream_mode(iargs[0])
+        elif cmd == "txperiodic":
+            period, payload = iargs[0], iargs[1]
+            st, _ = d.tx_periodic(period, payload)
         elif cmd == "txstop":
             st, _ = d.tx_stop()
         else:
@@ -583,6 +725,9 @@ class MKSGui:
         if t is not None:
             t.join(timeout=1.0)
         self.stream_thread = None
+        with self._stream_cmd_lock:              # снять неисполненную TX-заявку
+            self._stream_cmd = None
+        self._tx_pending = False
         try:
             if self.dev is not None:
                 self.dev.set_stream_mode(0)
@@ -592,6 +737,67 @@ class MKSGui:
             pass
         self.status.set("Поток остановлен.")
         self._refresh_controls()
+
+    # --------------------------------------- Передатчик M1 --
+    def on_tx_start(self):
+        if self.dev is None or self.busy or self.tx_active or self._tx_pending:
+            return
+        try:
+            period = int(self.tx_period_var.get())
+        except (ValueError, tk.TclError):
+            messagebox.showerror("TX", "Период TX — целое число мс (>= 5).")
+            return
+        if period < 5:
+            messagebox.showerror("TX", "Период TX должен быть >= 5 мс.")
+            return
+        try:
+            payload = parse_hex_payload(self.tx_payload_var.get())
+        except ValueError as e:
+            messagebox.showerror("TX", f"Payload: {e}")
+            return
+        self._tx_pending = True
+        self._refresh_controls()
+        self.status.set(f"Пуск TX ({period} мс)...")
+        if self.detecting:
+            # Поток активен — исполнить в потоковом треде (единый владелец порта).
+            with self._stream_cmd_lock:
+                self._stream_cmd = ("txperiodic", period, payload)
+        else:
+            self._spawn_tx(("txperiodic", period, payload))
+
+    def on_tx_stop(self):
+        if self.dev is None or self.busy or not self.tx_active or self._tx_pending:
+            return
+        self._tx_pending = True
+        self._refresh_controls()
+        self.status.set("Стоп TX...")
+        if self.detecting:
+            with self._stream_cmd_lock:
+                self._stream_cmd = ("txstop",)
+        else:
+            self._spawn_tx(("txstop",))
+
+    def _spawn_tx(self, req):
+        """Отправить TX-команду из отдельного треда (порт свободен — потока нет)."""
+        def worker():
+            try:
+                if req[0] == "txperiodic":
+                    st, _ = self.dev.tx_periodic(req[1], req[2])
+                else:
+                    st, _ = self.dev.tx_stop()
+                self.q.put(("txresult", req[0], st))
+            except Exception as e:
+                self.q.put(("txresult", req[0], None, str(e)))
+        threading.Thread(target=worker, daemon=True).start()
+
+    def on_save_png(self):
+        ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        name = f"cir_{ts}.png"
+        try:
+            self.fig.savefig(name, dpi=120)
+            self.status.set(f"График сохранён: {name}")
+        except Exception as e:
+            messagebox.showerror("Сохранение", str(e))
 
     def _begin_stream(self, content):
         self._stream_content = content
@@ -611,15 +817,6 @@ class MKSGui:
         self.stream_thread.start()
         self.nb.select(self.tab_mon)
         self.status.set(f"Поток запущен (content={content}).")
-
-    def on_save_png(self):
-        ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        name = f"cir_{ts}.png"
-        try:
-            self.fig.savefig(name, dpi=120)
-            self.status.set(f"График сохранён: {name}")
-        except Exception as e:
-            messagebox.showerror("Сохранение", str(e))
 
     # ------------------------------------------------------- запись CSV --
     def on_folder(self):
@@ -755,6 +952,11 @@ class MKSGui:
             pass
         try:
             if self.dev is not None:
+                if self.tx_active:
+                    try:
+                        self.dev.tx_stop()
+                    except Exception:
+                        pass
                 self.dev.close()
         except Exception:
             pass
@@ -764,6 +966,25 @@ class MKSGui:
     def _stream_loop(self):
         reader = StreamReader(self.dev.ser)
         while self.detecting:
+            # Отложенная TX-команда: этот тред — единый владелец порта, поэтому
+            # команду шлём здесь, а не из другого треда (иначе конкурентное чтение ser).
+            req = None
+            with self._stream_cmd_lock:
+                if self._stream_cmd is not None:
+                    req = self._stream_cmd
+                    self._stream_cmd = None
+            if req is not None:
+                try:
+                    if req[0] == "txperiodic":
+                        st, _ = self.dev.tx_periodic(req[1], req[2])
+                        self.q.put(("txresult", "txperiodic", st))
+                    else:
+                        st, _ = self.dev.tx_stop()
+                        self.q.put(("txresult", "txstop", st))
+                except Exception as e:
+                    self.q.put(("txresult", req[0], None, str(e)))
+                reader.buf.clear()               # после команды буфер мог разойтись — ресинк
+
             try:
                 frames = reader.poll()
             except Exception as e:
@@ -824,10 +1045,26 @@ class MKSGui:
                     self._refresh_controls()
                 elif kind == "scen_ok":
                     self.busy = False
-                    if item[1] in (1, 2):
-                        self._begin_stream(item[1])
+                    _, stream_on, tx_started = item
+                    if tx_started:
+                        self.tx_active = True
+                    if stream_on in (1, 2):
+                        self._begin_stream(stream_on)
                     else:
                         self.status.set("Сценарий выполнен (поток не включён).")
+                    self._refresh_controls()
+                elif kind == "txresult":
+                    name = item[1]
+                    st = item[2]
+                    err = item[3] if len(item) > 3 else None
+                    self._tx_pending = False
+                    if err is not None:
+                        self.status.set(f"TX ({name}): ошибка — {err}")
+                    elif st == 0x00:
+                        self.tx_active = (name == "txperiodic")
+                        self.status.set("TX идёт (M1 → M2)." if self.tx_active else "TX остановлен.")
+                    else:
+                        self.status.set(f"TX ({name}): {mks.status_name(st)}")
                     self._refresh_controls()
                 elif kind == "stream_err":
                     self.status.set(f"Поток прерван: {item[1]}")
@@ -915,6 +1152,13 @@ class MKSGui:
             self._draw_waterfall()
             self._last_wf_time = time.time()
 
+    def _wf_depth(self):
+        try:
+            d = int(self.wf_depth_var.get())
+        except (ValueError, tk.TclError):
+            d = WATERFALL_DEPTH
+        return max(20, min(WATERFALL_MAXLEN, d))
+
     def _draw_waterfall(self):
         self.wf_ax.clear()
         self.wf_ax.set_xlabel("индекс отсчёта")
@@ -924,7 +1168,7 @@ class MKSGui:
                             ha="center", va="center", transform=self.wf_ax.transAxes, color="gray")
             self.wf_canvas.draw_idle()
             return
-        mat, x0, x1 = build_waterfall_matrix(list(self.waterfall))
+        mat, x0, x1 = build_waterfall_matrix(list(self.waterfall), depth=self._wf_depth())
         if mat is None:
             self.wf_ax.text(0.5, 0.5, "нет данных (ждём кадры)", ha="center", va="center",
                             transform=self.wf_ax.transAxes, color="gray")
