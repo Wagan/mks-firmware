@@ -27,11 +27,14 @@ USB CDC поток кадров после каждого принятого UWB
 
 Запуск (нагрузочный замер потолка USB — киты EVK выключены, loopback M1->M2):
     python mks_stream_probe.py COM3
-    python mks_stream_probe.py COM3 --content 2 --txperiodic 10 --seconds 25
+    python mks_stream_probe.py COM3 --mode 4 --content 2 --txperiodic 10 --seconds 25
+  --mode 1..8     : PHY-пресет (деф. 3). ПРИЁМНИК должен совпадать с передатчиком
+                    (иначе 0 кадров). Значения = mks_gui.py PHY_MODES.
+  --phy "..."     : ручной PHY (6 чисел: ch dr plen code prf pac) вместо --mode.
   --content 1|2   : 1=метрики+CIR (деф.), 2=только метрики (лёгкий поток).
   --txperiodic ms : гнать TX_PERIODIC(период) для нагрузки M1->M2; без него — пассив.
   --seconds N     : авто-стоп через N c (иначе до Ctrl+C).
-Скрипт сам: init -> Mode 3 -> rx_start -> [TX_PERIODIC] -> stream on. Итог в конце.
+Скрипт сам: init -> SET_PHY(выбранный режим) -> rx_start -> [TX_PERIODIC] -> stream on.
 """
 
 from __future__ import annotations
@@ -44,8 +47,26 @@ import mks_protocol as mks
 
 SMARK = b"\xDE\xCA"
 
-# Mode 3 (как в консоли/GUI): ch2, 110k(код0), plen1024, code9, PRF64, PAC32.
-MODE3_PARAMS = bytes([2, 0, 1024 & 0xFF, (1024 >> 8) & 0xFF, 9, 64, 32])
+# Пресеты PHY (значения идентичны mks_gui.py PHY_MODES; ключ = номер Mode 1..8).
+# dr — код (0=110k, 1=850k, 2=6M8); prf — число МГц (16/64).
+PHY_MODES = {
+    1: dict(ch=2, dr=0, plen=1024, code=3, prf=16, pac=32),
+    2: dict(ch=2, dr=2, plen=128,  code=3, prf=16, pac=8),
+    3: dict(ch=2, dr=0, plen=1024, code=9, prf=64, pac=32),
+    4: dict(ch=2, dr=2, plen=128,  code=9, prf=64, pac=8),
+    5: dict(ch=5, dr=0, plen=1024, code=3, prf=16, pac=32),
+    6: dict(ch=5, dr=2, plen=128,  code=3, prf=16, pac=8),
+    7: dict(ch=5, dr=0, plen=1024, code=9, prf=64, pac=32),
+    8: dict(ch=5, dr=2, plen=128,  code=9, prf=64, pac=8),
+}
+
+
+def phy_params(m: dict) -> bytes:
+    """Собрать 7 байт SET_PHY_CONFIG из пресета (как cmd_setphy в консоли/GUI):
+    ch, dr, plen u16 LE, code, prf, pac."""
+    return bytes([m["ch"] & 0xFF, m["dr"] & 0xFF,
+                  m["plen"] & 0xFF, (m["plen"] >> 8) & 0xFF,
+                  m["code"] & 0xFF, m["prf"] & 0xFF, m["pac"] & 0xFF])
 
 
 def parse_stream_body(body: bytes) -> dict:
@@ -116,7 +137,28 @@ def main():
                     help="период мс для TX_PERIODIC (loopback M1->M2); без него — пассив")
     ap.add_argument("--seconds", type=float, default=None, metavar="N",
                     help="авто-стоп через N секунд (иначе до Ctrl+C)")
+    ap.add_argument("--mode", type=int, choices=range(1, 9), default=3, metavar="1..8",
+                    help="PHY-пресет Mode 1..8 (деф. 3). Приёмник должен совпадать с передатчиком")
+    ap.add_argument("--phy", default=None, metavar='"ch dr plen code prf pac"',
+                    help='ручной PHY вместо --mode: 6 чисел в кавычках, напр. "2 2 128 9 64 8"')
     args = ap.parse_args()
+
+    # Разрешить PHY: ручной (--phy) имеет приоритет над пресетом (--mode).
+    if args.phy is not None:
+        try:
+            vals = [int(x) for x in args.phy.split()]
+            if len(vals) != 6:
+                raise ValueError
+        except ValueError:
+            print('  --phy: нужно 6 чисел, напр. "2 2 128 9 64 8"')
+            return 2
+        phy = dict(ch=vals[0], dr=vals[1], plen=vals[2],
+                   code=vals[3], prf=vals[4], pac=vals[5])
+        phy_label = f"Ручной ({args.phy})"
+    else:
+        phy = PHY_MODES[args.mode]
+        phy_label = f"Mode {args.mode}"
+    phy_bytes = phy_params(phy)
 
     print(f"Открываю {args.port} ...")
     dev = mks.MKS(args.port)
@@ -124,8 +166,8 @@ def main():
     print("INIT ...")
     st, _ = dev.init(timeout=20.0)
     print(f"  INIT: {mks.status_name(st)}")
-    st, _ = dev.command(mks.CMD_SET_PHY_CONFIG, MODE3_PARAMS)
-    print(f"  SET_PHY_CONFIG(Mode 3): {mks.status_name(st)}")
+    st, _ = dev.command(mks.CMD_SET_PHY_CONFIG, phy_bytes)
+    print(f"  SET_PHY_CONFIG({phy_label}): {mks.status_name(st)}  [{phy}]")
     st, _ = dev.rx_start()
     print(f"  RX_START: {mks.status_name(st)}")
 
