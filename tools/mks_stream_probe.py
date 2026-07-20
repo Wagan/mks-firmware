@@ -194,6 +194,8 @@ def main():
     crc_errors = 0
     last_metrics = None
     last_cir = None
+    first_frame_time = None   # время 1-го принятого кадра (для честного среднего FPS)
+    last_frame_time = None    # время последнего принятого кадра
 
     try:
         while True:
@@ -207,6 +209,10 @@ def main():
                     crc_errors += 1
                     continue
                 received += 1
+                tframe = time.time()
+                if first_frame_time is None:
+                    first_frame_time = tframe
+                last_frame_time = tframe
                 seq = fr["seq"]
                 last_dropped = fr["dropped"]
                 peak_dropped = max(peak_dropped, last_dropped)
@@ -250,12 +256,17 @@ def main():
         dev.close()
 
     dur = time.time() - t0
-    avg_fps = received / dur if dur > 0 else 0.0
+    # Средний FPS — по интервалу между ПЕРВЫМ и ПОСЛЕДНИМ кадром (не по всей сессии
+    # с init/хвостом), чтобы средний совпадал с мгновенным из секундных строк.
+    if received >= 2 and first_frame_time is not None and last_frame_time > first_frame_time:
+        avg_str = f"{received / (last_frame_time - first_frame_time):.1f}"
+    else:
+        avg_str = "н/д"
     print("\n===== ИТОГ =====")
-    print(f"  условия:            content={args.content}, txperiodic={args.txperiodic} мс")
+    print(f"  условия:            content={args.content}, txperiodic={args.txperiodic} мс, {phy_label}")
     print(f"  длительность:       {dur:.1f} c")
     print(f"  принято кадров:     {received}")
-    print(f"  средний FPS:        {avg_fps:.1f}")
+    print(f"  средний FPS:        {avg_str} (по времени 1-го..последнего кадра)")
     print(f"  DROPPED прошивкой:  пик {peak_dropped} (u16, оборачивается)")
     print(f"  потеряно на хосте:  {host_lost} (дырки в SEQ)")
     print(f"  CRC/ошибок разбора: {crc_errors}")
