@@ -474,6 +474,11 @@ static ResponseStatus HandleINIT(const uint8_t* params, uint8_t params_len,
         /* PHY-поля (channel/data_rate/...) заполнит будущий SET_PHY_CONFIG. */
     }
 
+    /* Переинициализация — чистое состояние: сбросить залипшие снимок CIR и метрики
+     * (иначе GET_CIR/GET_SIGNAL_METRICS отдали бы старые данные до нового приёма). */
+    cir_snap.valid   = 0;
+    rx_metrics.valid = 0;
+
     if (live_count == 0) {
         return STATUS_RADIO_ERROR;    /* нет ни одного живого модуля */
     }
@@ -700,7 +705,8 @@ static ResponseStatus HandleRX_START(const uint8_t* params, uint8_t params_len,
     dwt_setrxtimeout(0);                        /* непрерывный приём (без таймаута) */
     if (dwt_rxenable(DWT_START_RX_IMMEDIATE) != DWT_SUCCESS) return STATUS_RADIO_ERROR;
 
-    rx_metrics.valid = 0;   /* метрики появятся от следующих принятых кадров */
+    rx_metrics.valid = 0;   /* сбросить залипшие метрики — до первого нового кадра */
+    cir_snap.valid   = 0;   /* и залипший снимок CIR (иначе GET_CIR отдаёт старый) */
     rx_active = 1;
     return STATUS_OK;
 }
