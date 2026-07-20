@@ -62,6 +62,38 @@ dev = mks_protocol('tcp', '127.0.0.1', 5555);
 The bridge is transparent (passes bytes both ways); all protocol logic stays in
 the firmware and in `mks_protocol.m`.
 
+### WireGuard VPN — the verified production setup (2026-07-20)
+
+The end-to-end setup actually used and validated: a **WireGuard VPN** links the
+local Windows PC (with the board) and the remote **Astra Linux** server running
+MATLAB, and the bridge listens on the VPN interface — no SSH tunnel needed.
+
+- Local Windows PC: board on **COM3**, WireGuard address **10.8.0.6**.
+- Remote server (Astra Linux): MATLAB 2025, WireGuard address **10.8.0.2**.
+
+On the **local** machine, bind the bridge to the VPN address so the server can
+reach it (bind to the WireGuard IP, not `0.0.0.0`, so only VPN peers connect):
+
+```
+python mks_tcp_bridge.py COM3 --tcp-port 5555 --listen 10.8.0.6
+```
+
+Then in MATLAB **on the server**, connect straight to the local machine's VPN IP:
+
+```matlab
+dev = mks_protocol('tcp', '10.8.0.6', 5555);
+% ... identical API from here on
+```
+
+Verified over this path: `ping`, `init` (module detection, live_count/mask),
+`set_phy` Mode 3, metrics (RSSI/FP_POWER/SNR/FP_INDEX + LOS class), single CIR,
+and live streaming via `example_stream.m` — parsed byte-for-byte, same as local.
+
+> Security: the bridge has no authentication, so only expose it inside a trusted
+> network. WireGuard already restricts access to VPN peers; binding to the VPN IP
+> (`--listen 10.8.0.6`) keeps it off any public interface. Do not bind `0.0.0.0`
+> on an untrusted network.
+
 ## Notes
 
 - One COM port / one board = one client at a time. Close the Python console/GUI
