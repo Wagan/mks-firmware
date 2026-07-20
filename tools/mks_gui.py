@@ -44,6 +44,7 @@ import collections
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 
+import numpy as np
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 
@@ -70,6 +71,8 @@ PRESENCE_WINDOW_S = 1.0
 PUMP_MS           = 60
 REC_FLUSH_EVERY   = 50
 WATERFALL_MAXLEN  = 500
+WF_PERIOD_S       = 0.15    # перерисовка водопада (~6/с; imshow тяжелее линии), только на активной вкладке
+WF_CMAP           = "turbo"
 
 METRICS_HEADER = ["frame_id", "timestamp", "count", "frames_per_sec", "RXPACC",
                   "RXPACC_NOSAT", "N_corrected", "CIR_PWR", "STD_NOISE", "FP_INDEX",
@@ -134,6 +137,28 @@ def default_scenario(phy: dict, mode_label: str, content: int) -> str:
     )
 
 
+def build_waterfall_matrix(frames):
+    """Собрать матрицу водопада из CIR-кадров (вариант А — по АБСОЛЮТНОМУ
+    sample_index; пустые ячейки = NaN, честно отражает дрожание FP по X).
+
+    frames — последовательность cir-dict (start_index, amps), новейший ПОСЛЕДНИМ.
+    Возвращает (matrix, x_min, x_max): row 0 = НОВЕЙШИЙ кадр (для origin='upper',
+    водопад течёт вниз). Если данных нет — (None, 0, 0)."""
+    frames = [f for f in frames if f and f.get("amps")]
+    if not frames:
+        return None, 0, 0
+    x_min = min(f["start_index"] for f in frames)
+    x_max = max(f["start_index"] + len(f["amps"]) - 1 for f in frames)
+    width = x_max - x_min + 1
+    rows = list(reversed(frames))                 # новейший — сверху (row 0)
+    mat = np.full((len(rows), width), np.nan, dtype=float)
+    for r, f in enumerate(rows):
+        s = f["start_index"] - x_min
+        amps = f["amps"]
+        mat[r, s:s + len(amps)] = amps
+    return mat, x_min, x_max
+
+
 class MKSGui:
     def __init__(self, root: tk.Tk, default_port: str = ""):
         self.root = root
@@ -185,15 +210,17 @@ class MKSGui:
         self.nb.grid(row=1, column=0, sticky="nsew", padx=6, pady=4)
 
         self.tab_mon = ttk.Frame(self.nb)
-        self.tab_set = ttk.Frame(self.nb)
         self.tab_wf = ttk.Frame(self.nb)
+        self.tab_set = ttk.Frame(self.nb)
         self.nb.add(self.tab_mon, text="Монитор")
-        self.nb.add(self.tab_set, text="Настройки")
         self.nb.add(self.tab_wf, text="Водопад")
+        self.nb.add(self.tab_set, text="Настройки")
 
         self._build_monitor(self.tab_mon)
-        self._build_settings(self.tab_set, default_port)
         self._build_waterfall(self.tab_wf)
+        self._build_settings(self.tab_set, default_port)
+        # bind ПОСЛЕ построения вкладок — иначе ранний TabChanged дёрнет пустой водопад
+        self.nb.bind("<<NotebookTabChanged>>", self._on_tab_changed)
 
         self.status = tk.StringVar(value="Готово. Настройки → Подключить.")
         ttk.Label(self.root, textvariable=self.status, relief="sunken",
@@ -330,10 +357,14 @@ class MKSGui:
         self.btn_folder.grid(row=0, column=4, **pad)
 
     def _build_waterfall(self, tab):
-        self.wf_label = ttk.Label(
-            tab, text="Водопад — в разработке (Шаг 3).\nБуфер CIR уже копится (deque).",
-            font=("Segoe UI", 12), anchor="center", justify="center")
-        self.wf_label.pack(expand=True, fill="both", padx=20, pady=40)
+        self.wf_fig = Figure(figsize=(6, 4), dpi=100)
+        self.wf_ax = self.wf_fig.add_subplot(111)
+        self.wf_ax.set_xlabel("индекс отсчёта")
+        self.wf_ax.set_ylabel("кадры (свежие сверху)")
+        self.wf_cbar = None
+        self._last_wf_time = 0.0
+        self.wf_canvas = FigureCanvasTkAgg(self.wf_fig, master=tab)
+        self.wf_canvas.get_tk_widget().pack(fill="both", expand=True)
 
     def _reset_axes(self):
         self.ax.clear()
@@ -572,12 +603,10 @@ class MKSGui:
         self._last_frame_time = 0.0
         self._plot_blanked = False
         self.tel_vars["mode"].set(self._current_mode)
+        self.waterfall.clear()                 # новая сессия — чистый водопад
         if content == 2:
             self._draw_cir_stub("CIR отключён (content=2 — только метрики)")
-            self.wf_label.configure(text="Водопад недоступен: CIR отключён (content=2).")
-        else:
-            self.wf_label.configure(
-                text="Водопад — в разработке (Шаг 3).\nБуфер CIR уже копится (deque).")
+        self._draw_waterfall()                 # заглушка/пустая карта под текущий content
         self.stream_thread = threading.Thread(target=self._stream_loop, daemon=True)
         self.stream_thread.start()
         self.nb.select(self.tab_mon)
@@ -816,6 +845,12 @@ class MKSGui:
             self.rec_status.configure(
                 text=f"● запись: {self._rec_written} кадров → {self._rec_info}",
                 foreground="red")
+        # Водопад перерисовываем прорежённо и ТОЛЬКО когда его вкладка видима.
+        if self.detecting and self._wf_visible():
+            twf = time.time()
+            if twf - self._last_wf_time >= WF_PERIOD_S:
+                self._draw_waterfall()
+                self._last_wf_time = twf
         self._update_indicator()
         self.root.after(PUMP_MS, self._pump_queue)
 
@@ -866,6 +901,47 @@ class MKSGui:
         self.ax.text(0.5, 0.5, text, ha="center", va="center", transform=self.ax.transAxes,
                      color="gray")
         self.canvas.draw_idle()
+
+    # ------------------------------------------------- водопад --
+    def _wf_visible(self):
+        try:
+            return self.nb.select() == str(self.tab_wf)
+        except Exception:
+            return False
+
+    def _on_tab_changed(self, event=None):
+        # при переключении на «Водопад» — сразу отрисовать текущий буфер
+        if self._wf_visible():
+            self._draw_waterfall()
+            self._last_wf_time = time.time()
+
+    def _draw_waterfall(self):
+        self.wf_ax.clear()
+        self.wf_ax.set_xlabel("индекс отсчёта")
+        self.wf_ax.set_ylabel("кадры (свежие сверху)")
+        if self._stream_content == 2:
+            self.wf_ax.text(0.5, 0.5, "CIR отключён (content=2 — только метрики)",
+                            ha="center", va="center", transform=self.wf_ax.transAxes, color="gray")
+            self.wf_canvas.draw_idle()
+            return
+        mat, x0, x1 = build_waterfall_matrix(list(self.waterfall))
+        if mat is None:
+            self.wf_ax.text(0.5, 0.5, "нет данных (ждём кадры)", ha="center", va="center",
+                            transform=self.wf_ax.transAxes, color="gray")
+            self.wf_canvas.draw_idle()
+            return
+        vmin = float(np.nanmin(mat))
+        vmax = float(np.nanmax(mat))
+        im = self.wf_ax.imshow(mat, aspect="auto", origin="upper", cmap=WF_CMAP,
+                               extent=[x0, x1, mat.shape[0], 0], interpolation="nearest",
+                               vmin=vmin, vmax=(vmax if vmax > vmin else vmin + 1.0))
+        self.wf_ax.set_xlabel("индекс отсчёта")
+        self.wf_ax.set_ylabel("кадры (свежие сверху)")
+        if self.wf_cbar is None:
+            self.wf_cbar = self.wf_fig.colorbar(im, ax=self.wf_ax, label="|CIR|")
+        else:
+            self.wf_cbar.update_normal(im)
+        self.wf_canvas.draw_idle()
 
     def _update_indicator(self):
         live = (self.detecting and self._last_frame_time > 0.0
