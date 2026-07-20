@@ -33,7 +33,7 @@ mks_protocol.py — библиотека протокола обмена ПК <-
   Wagan: 2026-07-17 — приближённая оценка мощности estimate_power() (RSSI/FP_POWER,
                       UM §4.7) + классификатор LOS/gray/NLOS (на хосте, для проверки).
   Wagan: 2026-07-17 — TX-команды: tx_frame/tx_stop (0x20/0x22), затем tx_periodic (0x21, v3).
-  Wagan: 2026-07-17 — set_tx_power (0x11, v4): ручная мощность TX, ответ power u32 LE.
+  Sergey: 2026-07-17 — set_tx_power (0x11, v4): ручная мощность TX, ответ power u32 LE.
   Wagan: 2026-07-17 — parse_signal_metrics 18→28→30 байт (v5): строгий RSSI/FP_POWER
                       (RXPACC_NOSAT) + total SNR (= RSL + delta) — считает прошивка.
   Wagan: 2026-07-17 — GET_CIR (0x41, v6): окно CIR вокруг first path + parse_cir().
@@ -223,15 +223,17 @@ class MKS:
     def tx_stop(self, timeout=None):
         return self.command(CMD_TX_STOP, timeout=timeout)
 
-    # Wagan: 2026-07-17 — SET_TX_POWER (0x11, v4): ручная мощность TX, ответ power u32 LE.
+    # Sergey: 2026-07-17 — SET_TX_POWER (0x11, v4): ручная мощность TX, ответ power u32 LE.
     def set_tx_power(self, power_level: int, timeout=None):
-        """SET_TX_POWER (0x11): ручная регулировка мощности передатчика (вариант A).
+        """SET_TX_POWER (0x11): ручная регулировка мощности передатчика (вариант A, см матчасть).
         PARAMS = power_level u8. БОЛЬШЕ power_level → БОЛЬШЕ мощность (0 ≈ минимум,
         POWER_LEVEL_MAX=0xDF ≈ максимум; шаг ≈ 0.5 dB). Прошивка ограничивает
         сверху 0xDF. Требует предварительного SET_PHY_CONFIG (нужен канал).
         Ответ DATA = применённое значение регистра power (u32 LE, 4 байта).
         Реализация: octet = 0xFF - power_level, дублируется во все 4 октета —
-        т.е. рост power_level уменьшает аттенюацию DA/mixer → мощность растёт."""
+        т.е. рост power_level уменьшает аттенюацию DA/mixer → мощность растёт. 
+        Был гимор с больше/меньше = решили: чем больше параметр, тем больше мощность
+        """
         if not (0 <= power_level <= 0xFF):
             raise ValueError("power_level вне диапазона u8")
         return self.command(CMD_SET_TX_POWER, bytes([power_level]), timeout=timeout)

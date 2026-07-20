@@ -48,10 +48,10 @@ Ctrl+C прерывает текущее ожидание/выходит.
   <Имя>: ГГГГ-ММ-ДД — описание — чтобы различать авторов):
   Wagan: 2026-07-16 — интерактивная консоль + прерываемое чтение, тест init.
   Wagan: 2026-07-17 — команды приёма: rxstart/rxstop/metrics (0x30/0x31/0x40).
-  Wagan: 2026-07-17 — в metrics — приближённая оценка RSSI/FP_POWER (UM §4.7) +
+  Andrey: 2026-07-17 — в metrics — приближённая оценка RSSI/FP_POWER (UM §4.7) +
                       классификатор LOS/gray/NLOS.
   Wagan: 2026-07-17 — команды передачи: txframe/txstop, затем txperiodic.
-  Wagan: 2026-07-17 — команда txpower (SET_TX_POWER 0x11).
+  Sergey: 2026-07-17 — команда txpower (SET_TX_POWER 0x11).
   Wagan: 2026-07-17 — печать total SNR (метрики 30 Б), баннер версии, шапки код-стайла.
   Wagan: 2026-07-17 — команда cir (GET_CIR 0x41): окно CIR ASCII-псевдографикой, маркер FP.
 """
@@ -130,7 +130,9 @@ def cmd_setphy(dev, args, show_hex):
     show_response(st, data, show_hex)
 
 
-# Wagan: 2026-07-17 — metrics: сырьё + приближ. RSSI/FP_POWER; печать SNR при 30-байт ответе.
+# Andrey: 2026-07-17 — metrics: сырьё + приближ. RSSI/FP_POWER; печать SNR при 30-байт ответе.
+# точной формулы расчета SNR нигде нет, то что есть - без описания параметров
+# параметры нашел только в исходниках DecaRanging 
 def cmd_metrics(dev, args, show_hex):
     # опциональный аргумент: PRF в МГц (16/64), по умолчанию 64 (Mode 3)
     prf = 64
@@ -227,7 +229,9 @@ def cmd_cir(dev, args, show_hex):
         print(f"    [{idx:4}] {a:8.0f} |{bar}{mark}")
 
 
-# Wagan: 2026-07-17 — txpower (SET_TX_POWER 0x11): больше level = мощнее.
+# Sergey: 2026-07-17 — txpower (SET_TX_POWER 0x11): больше level = мощнее.
+# Wagan: Можно было изначально понять, если параметр больше, то и мощность больше, так интуитивно понятно
+#        зачем было городить огород, мы в двух соснах заблудились в итоге
 def cmd_txpower(dev, args, show_hex):
     if not args:
         print("  использование: txpower <level>   (0..223; больше level = мощнее, 223 ≈ максимум)")
