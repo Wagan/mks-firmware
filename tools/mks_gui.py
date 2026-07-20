@@ -65,7 +65,7 @@ PHY_MODES = {
     "Mode 8 (ch5, 6M8, PRF64, code9)":   dict(ch=5, dr=2, plen=128,  code=9, prf=64, pac=8),
 }
 MANUAL_LABEL = "Ручной (6 полей)"
-DEFAULT_MODE = "Mode 4 (ch2, 6M8, PRF64, code9)"
+DEFAULT_MODE = "Mode 3 (ch2, 110k, PRF64, code9)"
 
 PRESENCE_WINDOW_S = 1.0
 PUMP_MS           = 60
@@ -307,7 +307,7 @@ class MKSGui:
         man = ttk.Frame(phy)
         man.grid(row=1, column=0, columnspan=7, sticky="w")
         for i, (key, dflt) in enumerate(
-                [("ch", 2), ("dr", 2), ("plen", 128), ("code", 9), ("prf", 64), ("pac", 8)]):
+                [("ch", 2), ("dr", 0), ("plen", 1024), ("code", 9), ("prf", 64), ("pac", 32)]):
             ttk.Label(man, text=key).grid(row=0, column=2 * i, padx=2)
             v = tk.StringVar(value=str(dflt))
             self.manual_vars[key] = v
