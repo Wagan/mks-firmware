@@ -16,6 +16,12 @@
     LEN16   = число байт после LEN16 и до CRC (SEQ+DROPPED+CONTENT+PAYLOAD).
     CONTENT = 1 → PAYLOAD = метрики(30) + окно CIR; 2 → PAYLOAD = метрики(30).
     CRC8    = poly 0x07 по [LEN16 .. конец PAYLOAD) (SMARK не входит).
+
+История изменений (для будущих правщиков: помечать правки в формате
+  <Имя>: ГГГГ-ММ-ДД — описание — чтобы различать авторов; до сих пор всё делал Wagan):
+  Wagan: 2026-07-20 — модуль выделен: общий разбор потокового кадра (parse_stream_body)
+                      и ре-синхронизация по SMARK (StreamReader) вынесены из
+                      mks_stream_probe.py, чтобы probe и GUI использовали ОДИН код.
 """
 
 from __future__ import annotations
@@ -27,6 +33,7 @@ import mks_protocol as mks
 SMARK = b"\xDE\xCA"
 
 
+# Wagan: 2026-07-20 — разбор тела потокового кадра (общий для probe и GUI).
 def parse_stream_body(body: bytes) -> dict:
     """Разобрать тело потокового кадра (SEQ+DROPPED+CONTENT+PAYLOAD, без SMARK/LEN16/
     CRC). Возвращает dict: seq, dropped, content, metrics (parse_signal_metrics),
@@ -42,6 +49,7 @@ def parse_stream_body(body: bytes) -> dict:
             "metrics": metrics, "cir": cir}
 
 
+# Wagan: 2026-07-20 — ре-синхронизация по SMARK: устойчив к мусору/битому CRC (общий).
 class StreamReader:
     """Извлекает потоковые кадры из байтового потока pyserial с ре-синхронизацией.
     poll() дочитывает доступные байты и возвращает список (body, crc_ok) готовых

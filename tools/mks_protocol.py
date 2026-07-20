@@ -24,29 +24,22 @@ mks_protocol.py — библиотека протокола обмена ПК <-
   - Ctrl+C срабатывал сразу (а не после длинного блокирующего read);
   - таймаут задавался на команду и переживал долгие операции (INIT).
 
-v2 (2026-07-16): добавлен приёмный слой — RX_START(0x30), RX_STOP(0x31),
-GET_SIGNAL_METRICS(0x40) + parse_signal_metrics() под ИНТЕРИМ-формат
-(сырые поля dwt_rxdiag_t, 18 байт, 9x u16 LE, PROTOCOL_SPEC §8).
-RSSI/SNR по формулам DW1000 UM §4.7 — отдельным шагом позже (нужен
-RXPACC_NOSAT, которого в интерим-формате нет).
-
-v3 (2026-07-17): добавлен TX_PERIODIC(0x21) — периодическая передача кадра
-(PARAMS = period_ms u16 LE + length u16 LE + payload). Останов — существующим
-TX_STOP(0x22), который теперь снимает и периодику.
-
-v4 (2026-07-17): добавлен SET_TX_POWER(0x11) — ручная регулировка мощности TX
-(вариант A: power_level u8, БОЛЬШЕ level → БОЛЬШЕ мощность; 0≈мин, 0xDF≈макс).
-Ответ DATA = применённый регистр power (u32 LE). Требует предварительного
-SET_PHY_CONFIG. Проверено loopback M1→M2: RX_LEVEL монотонно растёт с level.
-
-v5 (2026-07-17): GET_SIGNAL_METRICS расширен 18→28→30 байт (ФИНАЛ) — прошивка
-считает строгий RSSI/FP_POWER (UM §4.7, RXPACC_NOSAT) и total SNR (= RSL + delta,
-delta из DecaRanging: 79.5 для каналов 1/2/3/5, 77.0 для 4/7).
-parse_signal_metrics поддерживает 18 (интерим) / 28 / 30 (финал) байт по длине.
-
-v6 (2026-07-17): добавлен GET_CIR (0x41) — окно CIR вокруг first path (half u8),
-parse_cir(). Прошивка снимает окно accumulator в ветке приёма (до перевзвода RX);
-центрирование по FP делает прошивка. Консольная псевдографика в mks_console.
+История изменений (для будущих правщиков: помечать правки в формате
+  <Имя>: ГГГГ-ММ-ДД — описание — чтобы различать авторов; до сих пор всё делал Wagan):
+  Wagan: 2026-07-16 — первые хостовые скрипты протокола (PING/INIT/GET_STATUS, кадры,
+                      CRC8, прерываемое чтение poll-порциями под Ctrl+C и таймаут INIT).
+  Wagan: 2026-07-17 — приёмный слой: RX_START(0x30)/RX_STOP(0x31)/GET_SIGNAL_METRICS(0x40)
+                      + parse_signal_metrics() под интерим-формат (18 Б, сырьё dwt_rxdiag_t).
+  Wagan: 2026-07-17 — приближённая оценка мощности estimate_power() (RSSI/FP_POWER,
+                      UM §4.7) + классификатор LOS/gray/NLOS (на хосте, для проверки).
+  Wagan: 2026-07-17 — TX-команды: tx_frame/tx_stop (0x20/0x22), затем tx_periodic (0x21, v3).
+  Wagan: 2026-07-17 — set_tx_power (0x11, v4): ручная мощность TX, ответ power u32 LE.
+  Wagan: 2026-07-17 — parse_signal_metrics 18→28→30 байт (v5): строгий RSSI/FP_POWER
+                      (RXPACC_NOSAT) + total SNR (= RSL + delta) — считает прошивка.
+  Wagan: 2026-07-17 — GET_CIR (0x41, v6): окно CIR вокруг first path + parse_cir().
+  Wagan: 2026-07-17 — SET_STREAM_MODE (0x42): set_stream_mode() для потокового режима.
+  Wagan: 2026-07-18 — рантайм-обнаружение живых DW-модулей в INIT (не падать без M1) +
+                      parse_get_status толерантен к расширенному ответу (17 Б).
 """
 
 from __future__ import annotations
@@ -212,6 +205,7 @@ class MKS:
         params = struct.pack("<H", len(payload)) + payload
         return self.command(CMD_TX_FRAME, params, timeout=timeout)
 
+    # Wagan: 2026-07-17 — TX_PERIODIC (0x21, v3): периодическая передача кадра.
     def tx_periodic(self, period_ms: int, payload: bytes, timeout=None):
         """TX_PERIODIC (0x21): периодически слать один и тот же кадр.
         PARAMS = period_ms u16 LE + length u16 LE + payload.
@@ -229,6 +223,7 @@ class MKS:
     def tx_stop(self, timeout=None):
         return self.command(CMD_TX_STOP, timeout=timeout)
 
+    # Wagan: 2026-07-17 — SET_TX_POWER (0x11, v4): ручная мощность TX, ответ power u32 LE.
     def set_tx_power(self, power_level: int, timeout=None):
         """SET_TX_POWER (0x11): ручная регулировка мощности передатчика (вариант A).
         PARAMS = power_level u8. БОЛЬШЕ power_level → БОЛЬШЕ мощность (0 ≈ минимум,
@@ -241,6 +236,7 @@ class MKS:
             raise ValueError("power_level вне диапазона u8")
         return self.command(CMD_SET_TX_POWER, bytes([power_level]), timeout=timeout)
 
+    # Wagan: 2026-07-17 — GET_CIR (0x41, v6): окно CIR вокруг first path.
     def get_cir(self, half: int = 0, timeout=None):
         """GET_CIR (0x41): окно CIR вокруг first path.
         PARAMS = half u8 (полуширина окна; 0 = дефолт прошивки, макс. 30).
@@ -252,6 +248,7 @@ class MKS:
             raise ValueError("half вне диапазона u8")
         return self.command(CMD_GET_CIR, bytes([half]), timeout=timeout)
 
+    # Wagan: 2026-07-17 — SET_STREAM_MODE (0x42): вкл/выкл потоковый режим (CIR-2a).
     def set_stream_mode(self, mode: int, timeout=None):
         """SET_STREAM_MODE (0x42): 0=выкл (командный режим); 1=вкл (метрики+CIR);
         2=вкл (только метрики). DATA нет. При вкл плата после КАЖДОГО принятого
@@ -264,6 +261,7 @@ class MKS:
         return self.command(CMD_SET_STREAM_MODE, bytes([mode]), timeout=timeout)
 
 
+# Wagan: 2026-07-18 — толерантен к расширенному GET_STATUS (17 Б: +live_count/mask/dev_ids).
 def parse_get_status(data: bytes) -> dict:
     """Разобрать DATA GET_STATUS. Первые 7 байт — прежний формат; при наличии
     расширения (>=9 байт) добавляются live_count, live_mask и dev_ids (по модулю,
@@ -305,6 +303,7 @@ SIGNAL_METRICS_FIELDS = (
 )
 
 
+# Wagan: 2026-07-17 — разбор метрик по длине 18/28/30 Б (v5): +строгий RSSI/FP_POWER/SNR.
 def parse_signal_metrics(data: bytes) -> dict:
     """Разобрать DATA GET_SIGNAL_METRICS. Поддержаны два формата по ДЛИНЕ:
 
@@ -419,6 +418,7 @@ def _a_const(prf_mhz: int) -> float:
     raise ProtocolError(f"PRF {prf_mhz} МГц: A-константа не определена (только 16/64)")
 
 
+# Wagan: 2026-07-17 — приближённая оценка RSSI/FP_POWER (UM §4.7) + LOS/gray/NLOS (хост).
 def estimate_power(m: dict, prf_mhz: int = 64) -> dict:
     """Приближённая оценка RX_LEVEL и FP_POWER (dBm) из сырых метрик.
 

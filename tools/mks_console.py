@@ -43,6 +43,17 @@ mks_console.py — интерактивная консоль для управл
     quit / exit / q           — выход
 
 Ctrl+C прерывает текущее ожидание/выходит.
+
+История изменений (для будущих правщиков: помечать правки в формате
+  <Имя>: ГГГГ-ММ-ДД — описание — чтобы различать авторов; до сих пор всё делал Wagan):
+  Wagan: 2026-07-16 — интерактивная консоль + прерываемое чтение, тест init.
+  Wagan: 2026-07-17 — команды приёма: rxstart/rxstop/metrics (0x30/0x31/0x40).
+  Wagan: 2026-07-17 — в metrics — приближённая оценка RSSI/FP_POWER (UM §4.7) +
+                      классификатор LOS/gray/NLOS.
+  Wagan: 2026-07-17 — команды передачи: txframe/txstop, затем txperiodic.
+  Wagan: 2026-07-17 — команда txpower (SET_TX_POWER 0x11).
+  Wagan: 2026-07-17 — печать total SNR (метрики 30 Б), баннер версии, шапки код-стайла.
+  Wagan: 2026-07-17 — команда cir (GET_CIR 0x41): окно CIR ASCII-псевдографикой, маркер FP.
 """
 
 import sys
@@ -119,6 +130,7 @@ def cmd_setphy(dev, args, show_hex):
     show_response(st, data, show_hex)
 
 
+# Wagan: 2026-07-17 — metrics: сырьё + приближ. RSSI/FP_POWER; печать SNR при 30-байт ответе.
 def cmd_metrics(dev, args, show_hex):
     # опциональный аргумент: PRF в МГц (16/64), по умолчанию 64 (Mode 3)
     prf = 64
@@ -176,6 +188,7 @@ def cmd_metrics(dev, args, show_hex):
         print("    (кадр ещё не принят — valid=0; жди пакет EVK и повтори metrics)")
 
 
+# Wagan: 2026-07-17 — cir (GET_CIR 0x41): окно CIR ASCII-псевдографикой, маркер FP.
 def cmd_cir(dev, args, show_hex):
     # опциональный аргумент: half (полуширина окна). 0/нет → дефолт прошивки.
     half = 0
@@ -214,6 +227,7 @@ def cmd_cir(dev, args, show_hex):
         print(f"    [{idx:4}] {a:8.0f} |{bar}{mark}")
 
 
+# Wagan: 2026-07-17 — txpower (SET_TX_POWER 0x11): больше level = мощнее.
 def cmd_txpower(dev, args, show_hex):
     if not args:
         print("  использование: txpower <level>   (0..223; больше level = мощнее, 223 ≈ максимум)")
@@ -255,6 +269,7 @@ def cmd_txframe(dev, args, show_hex):
         print(f"    кадр отправлен ({len(payload)} байт payload + авто-FCS)")
 
 
+# Wagan: 2026-07-17 — txperiodic (TX_PERIODIC 0x21): период T мс + payload; стоп — txstop.
 def cmd_txperiodic(dev, args, show_hex):
     if len(args) < 2:
         print("  использование: txperiodic <T_ms> <b0> <b1> ...  (период мс, payload hex)")

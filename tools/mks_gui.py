@@ -37,6 +37,23 @@ mks_gui.py — GUI поверх готовой библиотеки.
 TX во время активного потока исполняется В САМОМ потоковом треде (единый владелец
 COM-порта — pyserial не потокобезопасен для конкурентного чтения).
 
+История изменений (для будущих правщиков: помечать правки в формате
+  <Имя>: ГГГГ-ММ-ДД — описание — чтобы различать авторов; до сих пор всё делал Wagan):
+  Wagan: 2026-07-17 — первый GUI: детектор присутствия СШП + живой график CIR
+                      (tkinter+matplotlib, поллинг GET_SIGNAL_METRICS/GET_CIR).
+  Wagan: 2026-07-17 — запись данных в CSV (лёгкий=метрики / полный=metrics+cir по frame_id).
+  Wagan: 2026-07-20 — Шаг 1: переход на ПОТОКОВЫЙ приём (SET_STREAM_MODE), акцент
+                      «МКС для MATLAB», кружок-индикатор, гашение по таймауту, запись
+                      из потока; общий парсер потока вынесен в mks_stream.py.
+  Wagan: 2026-07-20 — Шаг 2: вкладки, кнопки Старт/Стоп, сохраняемые сценарии старта,
+                      переключатель content (1=метрики+CIR, 2=только метрики).
+  Wagan: 2026-07-20 — Шаг 3: водопад CIR (imshow, свежее сверху, автомасштаб) +
+                      порядок вкладок Монитор/Водопад/Настройки.
+  Wagan: 2026-07-20 — дефолт PHY возвращён на Mode 3 (слушать два кита; Mode 4 требовал
+                      отдельный передатчик, которого нет).
+  Wagan: 2026-07-20 — Шаг 4: замороженная инфо-панель над вкладками, передатчик M1
+                      (loopback) + txperiodic в сценарии, водопад фиксированной глубины.
+
 Запуск:
     python mks_gui.py            # порт вводится в окне
     python mks_gui.py COM3       # порт аргументом (автозаполнить поле)
@@ -79,6 +96,8 @@ PHY_MODES = {
     "Mode 8 (ch5, 6M8, PRF64, code9)":   dict(ch=5, dr=2, plen=128,  code=9, prf=64, pac=8),
 }
 MANUAL_LABEL = "Ручной (6 полей)"
+# Wagan: 2026-07-20 — дефолт Mode 3 (по умолчанию слушаем два кита EVK; Mode 4 требовал
+# отдельный передатчик, которого сейчас нет).
 DEFAULT_MODE = "Mode 3 (ch2, 110k, PRF64, code9)"
 
 PRESENCE_WINDOW_S = 1.0
@@ -130,6 +149,7 @@ def parse_hex_payload(s: str) -> bytes:
     return bytes(out)
 
 
+# Wagan: 2026-07-20 — язык сценариев старта (Шаг 2); txperiodic добавлен в Шаге 4.
 def parse_scenario(text: str) -> list:
     """Разобрать текст сценария старта → список (cmd, args).
     Формат: одна команда на строку, '#' — комментарий, пустые строки игнорируются.
@@ -199,6 +219,8 @@ def default_scenario(phy: dict, mode_label: str, content: int) -> str:
     )
 
 
+# Wagan: 2026-07-20 — водопад по абсолютному sample_index (Шаг 3); depth-параметр
+# (фикс. глубина) добавлен в Шаге 4.
 def build_waterfall_matrix(frames, depth=None):
     """Собрать матрицу водопада из CIR-кадров (вариант А — по АБСОЛЮТНОМУ
     sample_index; пустые ячейки = NaN, честно отражает дрожание FP по X).
@@ -301,6 +323,8 @@ class MKSGui:
         ttk.Label(self.root, textvariable=self.status, relief="sunken",
                   anchor="w").grid(row=3, column=0, sticky="ew", padx=6, pady=(0, 6))
 
+    # Wagan: 2026-07-20 — замороженная инфо-панель над вкладками (Шаг 4): управление
+    # и телеметрия видны на любой вкладке; сюда же кнопки передатчика M1.
     def _build_panel(self, parent):
         pad = dict(padx=4, pady=3)
         panel = ttk.LabelFrame(parent, text="Управление и телеметрия")
@@ -739,6 +763,7 @@ class MKSGui:
         self._refresh_controls()
 
     # --------------------------------------- Передатчик M1 --
+    # Wagan: 2026-07-20 — передатчик M1 для self-contained loopback M1→M2 (Шаг 4).
     def on_tx_start(self):
         if self.dev is None or self.busy or self.tx_active or self._tx_pending:
             return
@@ -810,6 +835,7 @@ class MKSGui:
         self._plot_blanked = False
         self.tel_vars["mode"].set(self._current_mode)
         self.waterfall.clear()                 # новая сессия — чистый водопад
+        # Wagan: 2026-07-20 — content=2 (только метрики): CIR-график/водопад → заглушка (Шаг 2).
         if content == 2:
             self._draw_cir_stub("CIR отключён (content=2 — только метрики)")
         self._draw_waterfall()                 # заглушка/пустая карта под текущий content
@@ -963,6 +989,8 @@ class MKSGui:
         self.root.destroy()
 
     # ------------------------------------------- фоновый поток чтения --
+    # Wagan: 2026-07-20 — потоковый приём в приложение (Шаг 1); исполнение TX-команды
+    # в этом же треде (единый владелец COM-порта) добавлено в Шаге 4.
     def _stream_loop(self):
         reader = StreamReader(self.dev.ser)
         while self.detecting:
