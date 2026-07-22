@@ -719,7 +719,9 @@ static ResponseStatus HandleSET_PHY_CONFIG(const uint8_t* params, uint8_t params
          * Table 20 (ch2/PRF64 = 0x67676767). Раньше стоял 0x0E080222 — по UM §2.5.5.6
          * это дефолт ch5 SMART, для ch2/manual неверный (заниженная дальность). Ручная
          * SET_TX_POWER (0x11) перекрывает этот дефолт. Оба map-а для валидного канала
-         * всегда true; при false — TX-калибровку пропускаем, конфиг канала не роняем. */
+         * всегда true; при false — TX-калибровку пропускаем, конфиг канала не роняем.
+         * Dima: 2026-07-22 — довёл настройку TX до верной (канальный manual-дефолт
+         * Table 20 вместо ошибочного 0x0E080222). */
         uint8_t  pgdly;
         uint32_t txpow;
         if (map_pgdelay(channel, &pgdly) && tx_power_manual(channel, prf_raw, &txpow)) {
@@ -1324,13 +1326,26 @@ void PROTOCOL_PollRadio(void)
         rx_metrics.valid = 1;
         rx_metrics.count++;
 
-        PROTOCOL_CaptureCIR();                  /* снять окно CIR вокруг FP ДО rxenable */
-
-        if (stream_active) {
-            PROTOCOL_SendStreamFrame();         /* потоковый кадр (метрики+CIR) ДО rxenable */
+        /* Wagan/Andrey: 2026-07-22 — минимизируем окно ВЫКЛЮЧЕННОГО приёмника (причина
+         * потери кадров на любой мощности, см. RECON_rx_tuning). Кадр и диагностика уже
+         * в RAM (rx_frame/rx_metrics) — можно перевзводить RX раньше тяжёлой работы.
+         *   1) CIR-снимок нужен ТОЛЬКО для потока content=1 (окно CIR в кадре) ИЛИ в
+         *      командном режиме (стрим выкл — для GET_CIR). При активном потоке
+         *      content=2/3/4 (режим станции) CaptureCIR ПРОПУСКАЕМ — убираем ~250 Б
+         *      SPI-чтения аккумулятора из горячего пути.
+         *   2) dwt_rxenable — ДО SendStreamFrame (USB идёт при уже включённом RX).
+         *      cir_snap — КОПИЯ окна, снятая до rxenable, поэтому SendStreamFrame при
+         *      content=1 читает валидную копию, а не затёртый перевзводом accumulator. */
+        int need_cir = (stream_content == 1) || (!stream_active);
+        if (need_cir) {
+            PROTOCOL_CaptureCIR();              /* снимок (копия) ДО rxenable */
         }
 
-        dwt_rxenable(DWT_START_RX_IMMEDIATE);   /* снова слушаем */
+        dwt_rxenable(DWT_START_RX_IMMEDIATE);   /* RX включаем РАНЬШЕ USB-стрима */
+
+        if (stream_active) {
+            PROTOCOL_SendStreamFrame();         /* потоковый кадр — приёмник уже слушает */
+        }
     } else if (status & SYS_STATUS_ALL_RX_ERR) {
         /* Ошибка приёма: снять флаги, сброс приёмника (реинициализация LDE). */
         dwt_write32bitreg(SYS_STATUS_ID, SYS_STATUS_ALL_RX_ERR);
