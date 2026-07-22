@@ -238,6 +238,16 @@ class MKS:
             raise ValueError("power_level вне диапазона u8")
         return self.command(CMD_SET_TX_POWER, bytes([power_level]), timeout=timeout)
 
+    # Wagan: 2026-07-22 — SET_TX_POWER сырой 4-байтовый формат (params_len==4): регистр
+    # TX_POWER как есть (для smart-режима с разными октетами). Level-формат — set_tx_power.
+    def set_tx_power_raw(self, reg_u32: int, timeout=None):
+        """SET_TX_POWER (0x11), сырой формат: PARAMS = tx_power u32 LE — записывается в
+        регистр TX_POWER как есть (без клампа). Требует SET_PHY_CONFIG (канал для PGdelay).
+        Ответ DATA = применённый power (u32 LE)."""
+        if not (0 <= reg_u32 <= 0xFFFFFFFF):
+            raise ValueError("reg_u32 вне диапазона u32")
+        return self.command(CMD_SET_TX_POWER, struct.pack("<I", reg_u32), timeout=timeout)
+
     # Wagan: 2026-07-17 — GET_CIR (0x41, v6): окно CIR вокруг first path.
     def get_cir(self, half: int = 0, timeout=None):
         """GET_CIR (0x41): окно CIR вокруг first path.

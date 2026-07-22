@@ -93,7 +93,7 @@ class StationGui:
     # ------------------------------------------------------------------ UI --
     def _build(self):
         self.root.columnconfigure(0, weight=1)
-        self.root.rowconfigure(3, weight=1)
+        self.root.rowconfigure(4, weight=1)
 
         ttk.Label(self.root, text=APP_TITLE, font=("Segoe UI", 11, "bold")).grid(
             row=0, column=0, sticky="w", padx=8, pady=(6, 0))
@@ -130,14 +130,17 @@ class StationGui:
             ttk.Label(sig, textvariable=v, font=("Consolas", 10), width=20,
                       anchor="w").pack(side="left", padx=6)
 
+        # --- Панель мощности TX (свой передатчик) ---
+        self._build_power_panel()
+
         # --- Баннер входящего вызова ---
         self.call_lbl = tk.Label(self.root, text="", font=("Segoe UI", 13, "bold"),
                                  fg="white", bg=self.root.cget("bg"))
-        self.call_lbl.grid(row=2, column=0, sticky="ew", padx=6)
+        self.call_lbl.grid(row=3, column=0, sticky="ew", padx=6)
 
         # --- Лог сообщений ---
         logf = ttk.LabelFrame(self.root, text="Сообщения")
-        logf.grid(row=3, column=0, sticky="nsew", padx=6, pady=4)
+        logf.grid(row=4, column=0, sticky="nsew", padx=6, pady=4)
         logf.rowconfigure(0, weight=1)
         logf.columnconfigure(0, weight=1)
         self.log = tk.Text(logf, height=14, width=70, state="disabled", wrap="word",
@@ -153,7 +156,7 @@ class StationGui:
 
         # --- Ввод + счётчик + кнопки ---
         bottom = ttk.Frame(self.root)
-        bottom.grid(row=4, column=0, sticky="ew", padx=6, pady=(0, 6))
+        bottom.grid(row=5, column=0, sticky="ew", padx=6, pady=(0, 6))
         bottom.columnconfigure(0, weight=1)
         self.entry = ttk.Entry(bottom, font=("Consolas", 11))
         self.entry.grid(row=0, column=0, sticky="ew")
@@ -168,6 +171,43 @@ class StationGui:
         self._draw_bars(0, fresh=False)
         self._log("система", "Станция запущена (content=4). Введите текст и Enter.", "sys")
 
+    def _build_power_panel(self):
+        # канал/PRF станции -> «стандарт под маску» (Table 20) и стартовый уровень
+        phy = ST.PHY_MODES.get(self.st.mode, {})
+        self._ch = phy.get("ch")
+        self._prf = phy.get("prf")
+        self._std_level = ST.std_tx_level(self._ch, self._prf)
+        start = self._std_level if self._std_level is not None else (ST.POWER_LEVEL_MAX // 2)
+
+        pf = ttk.LabelFrame(self.root, text="Мощность TX (свой передатчик M1)")
+        pf.grid(row=2, column=0, sticky="ew", padx=6, pady=2)
+        pf.columnconfigure(1, weight=1)
+
+        ttk.Label(pf, text="слабее ↔ мощнее:").grid(row=0, column=0, sticky="w", padx=6)
+        self.level_var = tk.IntVar(value=start)
+        self.power_scale = tk.Scale(pf, from_=0, to=ST.POWER_LEVEL_MAX, orient="horizontal",
+                                    variable=self.level_var, showvalue=False,
+                                    command=lambda v: self._on_power_move())
+        self.power_scale.grid(row=0, column=1, sticky="ew", padx=6)
+        # применяем ТОЛЬКО по отпусканию (не флудить командами на каждый пиксель)
+        self.power_scale.bind("<ButtonRelease-1>", lambda e: self._apply_power())
+
+        self.power_lbl = tk.Label(pf, text="", font=("Consolas", 10), width=42, anchor="w")
+        self.power_lbl.grid(row=0, column=2, sticky="w", padx=6)
+
+        btns = ttk.Frame(pf)
+        btns.grid(row=1, column=0, columnspan=3, sticky="w", padx=6, pady=(0, 4))
+        std_txt = "Стандарт (под маску) = дефолт set_phy"
+        ttk.Button(btns, text=std_txt,
+                   command=lambda: self._preset(self._std_level)).pack(side="left", padx=2)
+        ttk.Button(btns, text="Железный макс (лаб., ~9 dB выше маски)",
+                   command=lambda: self._preset(ST.POWER_LEVEL_MAX)).pack(side="left", padx=2)
+        self.power_applied = tk.Label(btns, text="применено: — (дефалт set_phy)",
+                                      foreground="#777777")
+        self.power_applied.pack(side="left", padx=10)
+
+        self._on_power_move()          # заполнить подпись (без отправки)
+
     # -------------------------------------------------------------- действия --
     def _send(self):
         text = self.entry.get()
@@ -180,6 +220,30 @@ class StationGui:
     def _call(self):
         self.st.send_call()
         self._log("система", "→ ВЫЗОВ отправлен", "sys")
+
+    # -------------------------------------------------------------- мощность --
+    def _power_zone(self, level):
+        if self._std_level is None:
+            return ""
+        if level <= self._std_level:
+            return "под/на маске"
+        return "ВЫШЕ маски (стенд)"
+
+    def _on_power_move(self):
+        lvl = int(self.level_var.get())
+        reg = ST.level_to_reg(lvl)
+        self.power_lbl.configure(text=f"level=0x{lvl:02X}  рег=0x{reg:08X}  [{self._power_zone(lvl)}]")
+
+    def _apply_power(self):
+        lvl = int(self.level_var.get())
+        self.st.request_tx_power(lvl)          # исполнит engine-тред, вернёт событие txpower
+
+    def _preset(self, level):
+        if level is None:
+            return
+        self.level_var.set(int(level))
+        self._on_power_move()
+        self._apply_power()
 
     def _update_counter(self):
         nbytes = len(self.entry.get().encode("utf-8"))
@@ -265,6 +329,15 @@ class StationGui:
             pass                          # индикатор обновляется в _tick по snapshot
         elif t == "tx_warn":
             self._log("система", f"TX: {ev['msg']}", "sys")
+        elif t == "txpower":
+            reg = f"0x{ev['reg']:08X}" if ev.get("reg") is not None else "—"
+            if ev.get("ok"):
+                self.power_applied.configure(
+                    text=f"применено: level=0x{ev['level']:02X} рег={reg}", foreground="#188038")
+                self._log("система", f"мощность TX применена: level=0x{ev['level']:02X} рег={reg}", "sys")
+            else:
+                self.power_applied.configure(text=f"ошибка: {ev.get('status')}", foreground="#d93025")
+                self._log("система", f"мощность TX: ошибка {ev.get('status')}", "bad")
         elif t == "error":
             self._log("система", f"поток прерван: {ev['msg']}", "bad")
         # "status" — для консоли; в GUI индикатор живой, игнорируем

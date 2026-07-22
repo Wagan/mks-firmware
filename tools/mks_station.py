@@ -67,6 +67,27 @@ PHY_MODES = {
 }
 
 STREAM_CONTENT = 4      # заход 2: станция слушает поток «данные+метрики»
+POWER_LEVEL_MAX = 0xDF  # кламп прошивки (SET_TX_POWER level-формат) = октет 0x20
+
+# Table 20 manual TX power октет по каналу/PRF (UM §7.2.31.4, DIS_STXP=1). Одноктетно —
+# значения выразимы через level = 0xFF - октет. Зеркало прошивочной tx_power_manual.
+TX_STD_OCTET = {
+    64: {1: 0x67, 2: 0x67, 3: 0x8B, 4: 0x9A, 5: 0x85, 7: 0xD1},
+    16: {1: 0x75, 2: 0x75, 3: 0x6F, 4: 0x5F, 5: 0x48, 7: 0x92},
+}
+
+
+def std_tx_level(channel, prf):
+    """level, дающий канальный Table-20 октет (0xFF-октет) — «стандарт под маску».
+    None, если канал/PRF нет в таблице."""
+    o = TX_STD_OCTET.get(prf, {}).get(channel)
+    return None if o is None else (0xFF - o)
+
+
+def level_to_reg(level):
+    """level → регистр TX_POWER (октет 0xFF-level ×4), как считает прошивка."""
+    o = (0xFF - int(level)) & 0xFF
+    return (o << 24) | (o << 16) | (o << 8) | o
 
 
 def phy_params(m: dict) -> bytes:
@@ -116,8 +137,13 @@ class Station:
 
         self.msgid = MsgId()
         self.tx_q = queue.Queue()
+        self.cmd_q = queue.Queue()           # команды на исполнение в engine-треде (напр. TX-мощность)
         self.reasm = M.Reassembler(timeout=max(3.0, link_timeout))
         self.running = False
+
+        # мощность передатчика (свой M1) — обновляется по факту применения в engine
+        self.tx_level = None
+        self.tx_reg = None
 
         # состояние партнёра (владелец — engine-тред)
         self.last_heard = 0.0
@@ -158,6 +184,23 @@ class Station:
             self.dev.tx_frame(fr)
         except Exception:
             pass
+
+    def request_tx_power(self, level):
+        """Заявка на смену TX-мощности СВОЕГО передатчика (level 0..0xDF). Исполняется
+        в engine-треде (единый владелец порта). Перекрывает канальный дефолт set_phy."""
+        self.cmd_q.put(("txpower", max(0, min(POWER_LEVEL_MAX, int(level)))))
+
+    def _apply_tx_power(self, level):
+        """Исполнить SET_TX_POWER(level) — ТОЛЬКО из engine-треда. Эмитит результат."""
+        try:
+            st, data = self.dev.set_tx_power(level)
+            reg = int.from_bytes(bytes(data[:4]), "little") if (st == 0x00 and len(data) >= 4) else None
+            if st == 0x00:
+                self.tx_level, self.tx_reg = level, reg
+            self._emit(type="txpower", level=level, reg=reg, ok=(st == 0x00),
+                       status=mks.status_name(st))
+        except Exception as e:
+            self._emit(type="txpower", level=level, reg=None, ok=False, status=str(e))
 
     # ------------------------------------------------- разбор одного кадра --
     def _ingest(self, sf, now):
@@ -229,6 +272,17 @@ class Station:
                     sent_any = True
             except queue.Empty:
                 pass
+
+            # команды (SET_TX_POWER и т.п.) — в этом же треде (владелец порта)
+            try:
+                while True:
+                    cmd = self.cmd_q.get_nowait()
+                    if cmd[0] == "txpower":
+                        self._apply_tx_power(cmd[1])
+                    sent_any = True
+            except queue.Empty:
+                pass
+
             if sent_any:
                 reader.buf.clear()
 
@@ -339,6 +393,9 @@ def _console_printer(ev):
         print("\n" + ev["line"], flush=True)
     elif t == "tx_warn":
         print(f"\n[TX] {ev['msg']}", flush=True)
+    elif t == "txpower":
+        reg = f"0x{ev['reg']:08X}" if ev.get("reg") is not None else "—"
+        print(f"\n[МОЩНОСТЬ] level=0x{ev['level']:02X} рег={reg} ({ev['status']})", flush=True)
     elif t == "error":
         print(f"\n[RX] поток прерван: {ev['msg']}", flush=True)
     # "sent" — пользователь сам ввёл в консоль, не дублируем
@@ -375,7 +432,7 @@ def main():
     st.start()
 
     print(f"\nСтанция {name} на связи (content=4). Команды: <текст> отправить | /call вызов | "
-          f"/status | /quit. Ctrl+C — выход.\n")
+          f"/power <level> | /status | /quit. Ctrl+C — выход.\n")
     try:
         while True:
             line = input()
@@ -388,8 +445,17 @@ def main():
                 print("  → ВЫЗОВ отправлен")
             elif line == "/status":
                 print("  " + st.status_line())
+            elif line.startswith("/power"):
+                parts = line.split()
+                try:
+                    lvl = int(parts[1], 0)
+                    st.request_tx_power(lvl)
+                    print(f"  → мощность level=0x{lvl & 0xFF:02X} (заявка отправлена)")
+                except (IndexError, ValueError):
+                    print("  использование: /power <level>   (0..0xDF; напр. /power 0x98 = стандарт, "
+                          "/power 0xDF = железный макс)")
             elif line.startswith("/"):
-                print("  команды: /call /status /quit  (или просто текст для отправки)")
+                print("  команды: /call /status /power <level> /quit  (или текст для отправки)")
             else:
                 st.send_text(line)
     except (KeyboardInterrupt, EOFError):
