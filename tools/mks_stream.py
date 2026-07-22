@@ -35,6 +35,7 @@ SMARK = b"\xDE\xCA"
 
 # Wagan: 2026-07-20 — разбор тела потокового кадра (общий для probe и GUI).
 # Wagan: 2026-07-22 — разбор content=3 (канал данных): PAYLOAD = data_len(u16 LE)+data.
+# Wagan: 2026-07-22 — разбор content=4 (данные+метрики, RSSI-в-beacon): метрики30 + data.
 def parse_stream_body(body: bytes) -> dict:
     """Разобрать тело потокового кадра (SEQ+DROPPED+CONTENT+PAYLOAD, без SMARK/LEN16/
     CRC). Возвращает dict: seq, dropped, content, metrics, cir, data.
@@ -42,7 +43,9 @@ def parse_stream_body(body: bytes) -> dict:
       content=1: метрики[5:35] + окно CIR[35:]  → metrics, cir; data=None.
       content=2: метрики[5:35]                  → metrics; cir=None, data=None.
       content=3: data_len u16 LE [5:7] + data[7:7+data_len] → data (bytes);
-                 metrics=None, cir=None."""
+                 metrics=None, cir=None.
+      content=4: метрики[5:35] + data_len u16 LE [35:37] + data[37:37+data_len]
+                 → metrics И data (тот же кадр); cir=None."""
     if len(body) < 5:
         raise mks.ProtocolError(f"поток: тело короче заголовка ({len(body)})")
     seq, dropped = struct.unpack_from("<HH", body, 0)
@@ -58,6 +61,18 @@ def parse_stream_body(body: bytes) -> dict:
         data = bytes(body[7:7 + data_len])
         return {"seq": seq, "dropped": dropped, "content": content,
                 "metrics": None, "cir": None, "data": data}
+
+    if content == 4:                       # данные + метрики (того же принятого кадра)
+        if len(body) < 5 + 30 + 2:
+            raise mks.ProtocolError(f"поток content=4: тело короче метрик+data_len ({len(body)})")
+        metrics = mks.parse_signal_metrics(body[5:35])
+        data_len = struct.unpack_from("<H", body, 35)[0]
+        if len(body) < 37 + data_len:
+            raise mks.ProtocolError(
+                f"поток content=4: тело короче data_len (нужно {37 + data_len}, есть {len(body)})")
+        data = bytes(body[37:37 + data_len])
+        return {"seq": seq, "dropped": dropped, "content": content,
+                "metrics": metrics, "cir": None, "data": data}
 
     # content=1/2: метрики (+CIR)
     if len(body) < 5 + 30:

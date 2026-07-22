@@ -251,18 +251,21 @@ class MKS:
         return self.command(CMD_GET_CIR, bytes([half]), timeout=timeout)
 
     # Wagan: 2026-07-17 — SET_STREAM_MODE (0x42): вкл/выкл потоковый режим (CIR-2a).
-    # Wagan: 2026-07-22 — добавлен mode=3 (канал данных §15.1 стадия 0).
+    # Wagan: 2026-07-22 — mode=3 (канал данных) и mode=4 (данные+метрики, RSSI-в-beacon).
     def set_stream_mode(self, mode: int, timeout=None):
         """SET_STREAM_MODE (0x42): 0=выкл (командный режим); 1=вкл (метрики+CIR);
-        2=вкл (только метрики); 3=вкл (только данные — тело принятого кадра без FCS).
+        2=вкл (только метрики); 3=вкл (только данные — тело принятого кадра без FCS);
+        4=вкл (данные+метрики — тело кадра + блок метрик того же кадра, без CIR).
         DATA нет. При вкл плата после КАЖДОГО принятого UWB-кадра сама шлёт потоковый
         кадр (свой формат: SMARK 0xDE 0xCA | LEN16 | SEQ | DROPPED | CONTENT | PAYLOAD |
-        CRC8; CONTENT=1 → метрики30+окноCIR, CONTENT=2 → только метрики30, CONTENT=3 →
-        data_len(u16 LE)+data) — читать отдельным приёмником (см. tools/mks_stream_probe.py
-        для метрик/CIR, tools/mks_data_probe.py для данных). Пока поток включён,
-        командный канал занят потоком."""
-        if mode not in (0, 1, 2, 3):
-            raise ValueError("mode должен быть 0, 1, 2 или 3")
+        CRC8; CONTENT=1 → метрики30+окноCIR, 2 → метрики30, 3 → data_len(u16 LE)+data,
+        4 → метрики30+data_len+data) — читать отдельным приёмником (см.
+        tools/mks_stream_probe.py для метрик/CIR, tools/mks_data_probe.py для данных).
+        Практическая предосторожность: пока поток включён, командный канал делит USB с
+        потоком (в прошивке лока команд НЕТ, но ответ на команду перемежается с
+        потоковыми кадрами — различать по маркеру SYNC 0xAA55 vs SMARK 0xDECA)."""
+        if mode not in (0, 1, 2, 3, 4):
+            raise ValueError("mode должен быть 0, 1, 2, 3 или 4")
         return self.command(CMD_SET_STREAM_MODE, bytes([mode]), timeout=timeout)
 
 
