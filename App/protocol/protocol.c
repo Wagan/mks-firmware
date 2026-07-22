@@ -42,6 +42,19 @@
  * «с SYNC», переключить в 1 в одном месте. 0 = без SYNC (принятое решение). */
 #define PROTOCOL_CRC_COVERS_SYNC   0
 
+/* Wagan/Dima: 2026-07-22 — полудуплекс на ОДНОМ чипе (однокабельная сборка MKS_SIMPLEX,
+ * §15.1). TX и RX на одном модуле: перед передачей снять приём (forcetrxoff), после
+ * TXFRS вернуть приём (rxenable) — иначе чип останется глух (PollRadio перевзводит RX
+ * только по RXFCG). В двухмодульной сборке (DW_SINGLE_MODULE=0) TX/RX на разных чипах —
+ * макросы пустые, путь прежний. */
+#if DW_SINGLE_MODULE
+  #define HALFDUPLEX_RX_OFF()  do { dwt_forcetrxoff(); } while (0)
+  #define HALFDUPLEX_RX_ON()   do { dwt_rxenable(DWT_START_RX_IMMEDIATE); } while (0)
+#else
+  #define HALFDUPLEX_RX_OFF()  do { } while (0)
+  #define HALFDUPLEX_RX_ON()   do { } while (0)
+#endif
+
 #define GET_U16LE(p) ((uint16_t)(p)[0] | ((uint16_t)(p)[1] << 8))
 #define PUT_U16LE(p, v) do { (p)[0] = (v) & 0xFF; (p)[1] = ((v) >> 8) & 0xFF; } while(0)
 
@@ -485,6 +498,21 @@ static ResponseStatus HandleINIT(const uint8_t* params, uint8_t params_len,
         return STATUS_RADIO_ERROR;    /* нет ни одного живого модуля */
     }
 
+#if DW_SINGLE_MODULE
+    /* Wagan/Dima: 2026-07-22 — однокабельная сборка: рабочий чип — только
+     * DW_RX_LISTEN_DEV. Прочие живые модули (M1) ЗАГЛУШИТЬ (dwt_forcetrxoff), чтобы не
+     * наводили на приёмник (гипотеза самоглушения §15.1). На плате только с M2 прочих
+     * живых нет — цикл ничего не делает. Запас, если наводка останется: dwt_entersleep
+     * (глубже, требует dwt_configuresleep + wake). */
+    for (int i = 0; i < DW_DEVICE_COUNT; i++) {
+        if (dw_dev_state[i].initialized && i != DW_RX_LISTEN_DEV) {
+            if (deca_port_select_device(i) == DWT_SUCCESS) {
+                dwt_forcetrxoff();
+            }
+        }
+    }
+#endif
+
     static uint8_t data[2];
     data[0] = live_count;
     data[1] = live_mask;
@@ -709,6 +737,12 @@ static ResponseStatus HandleSET_PHY_CONFIG(const uint8_t* params, uint8_t params
     int configured = 0;
     for (int i = 0; i < DW_DEVICE_COUNT; i++) {
         if (!dw_dev_state[i].initialized) continue;
+#if DW_SINGLE_MODULE
+        /* Wagan/Dima: 2026-07-22 — однокабельная сборка: конфигурим ТОЛЬКО рабочий чип;
+         * прочие (M1) не трогаем — иначе dwt_configure поднимет PLL M1 и он снова начнёт
+         * наводить (нужен «тихий» M1, заглушённый в INIT). */
+        if (i != DW_RX_LISTEN_DEV) continue;
+#endif
 
         if (deca_port_select_device(i) != DWT_SUCCESS) return STATUS_RADIO_ERROR;
         dwt_configure(&cfg);   /* void: валидация уже сделана ДО вызова */
@@ -1050,23 +1084,30 @@ static ResponseStatus HandleTX_FRAME(const uint8_t* params, uint8_t params_len,
     if (!dw_dev_state[DW_TX_SOURCE_DEV].initialized) return STATUS_RADIO_ERROR;
     if (deca_port_select_device(DW_TX_SOURCE_DEV) != DWT_SUCCESS) return STATUS_RADIO_ERROR;
 
+    HALFDUPLEX_RX_OFF();   /* одночиповой полудуплекс: снять приём перед передачей */
+
     dwt_write32bitreg(SYS_STATUS_ID, SYS_STATUS_TXFRS);       /* очистить флаг завершения TX */
 
     /* length+2: место под авто-FCS; dwt_writetxdata запишет length байт payload. */
-    if (dwt_writetxdata((uint16_t)(length + 2), (uint8_t*)&params[2], 0) != DWT_SUCCESS)
+    if (dwt_writetxdata((uint16_t)(length + 2), (uint8_t*)&params[2], 0) != DWT_SUCCESS) {
+        HALFDUPLEX_RX_ON();                                   /* вернуть приём и на ошибке */
         return STATUS_RADIO_ERROR;
+    }
     dwt_writetxfctrl((uint16_t)(length + 2), 0, 0);           /* ranging=0 (обычный data-кадр) */
 
-    if (dwt_starttx(DWT_START_TX_IMMEDIATE) != DWT_SUCCESS)
+    if (dwt_starttx(DWT_START_TX_IMMEDIATE) != DWT_SUCCESS) {
+        HALFDUPLEX_RX_ON();
         return STATUS_RADIO_ERROR;
+    }
 
     /* Ждём TXFRS (кадр ушёл в эфир) с ограничением — защита от вечного цикла. */
     uint32_t guard = TX_WAIT_GUARD;
     while (!(dwt_read32bitreg(SYS_STATUS_ID) & SYS_STATUS_TXFRS)) {
-        if (--guard == 0) return STATUS_TIMEOUT;              /* кадр не ушёл */
+        if (--guard == 0) { HALFDUPLEX_RX_ON(); return STATUS_TIMEOUT; }  /* кадр не ушёл */
     }
     dwt_write32bitreg(SYS_STATUS_ID, SYS_STATUS_TXFRS);      /* снять флаг */
 
+    HALFDUPLEX_RX_ON();    /* одночиповой полудуплекс: снова слушаем */
     return STATUS_OK;
 }
 
@@ -1083,6 +1124,7 @@ static ResponseStatus HandleTX_STOP(const uint8_t* params, uint8_t params_len,
     if (!dw_dev_state[DW_TX_SOURCE_DEV].initialized) return STATUS_RADIO_ERROR;
     if (deca_port_select_device(DW_TX_SOURCE_DEV) != DWT_SUCCESS) return STATUS_RADIO_ERROR;
     dwt_forcetrxoff();
+    HALFDUPLEX_RX_ON();   /* одночиповой: после останова передачи чип продолжает слушать */
     return STATUS_OK;
 }
 
@@ -1372,12 +1414,18 @@ void PROTOCOL_PollTx(void)
 
     if (deca_port_select_device(DW_TX_SOURCE_DEV) != DWT_SUCCESS) return;
 
+    HALFDUPLEX_RX_OFF();   /* одночиповой полудуплекс: снять приём перед передачей */
+
     dwt_write32bitreg(SYS_STATUS_ID, SYS_STATUS_TXFRS);
-    if (dwt_writetxdata((uint16_t)(tx_periodic_len + 2), tx_periodic_frame, 0) != DWT_SUCCESS)
+    if (dwt_writetxdata((uint16_t)(tx_periodic_len + 2), tx_periodic_frame, 0) != DWT_SUCCESS) {
+        HALFDUPLEX_RX_ON();
         return;
+    }
     dwt_writetxfctrl((uint16_t)(tx_periodic_len + 2), 0, 0);
-    if (dwt_starttx(DWT_START_TX_IMMEDIATE) != DWT_SUCCESS)
+    if (dwt_starttx(DWT_START_TX_IMMEDIATE) != DWT_SUCCESS) {
+        HALFDUPLEX_RX_ON();
         return;
+    }
 
     uint32_t guard = TX_WAIT_GUARD;
     while (!(dwt_read32bitreg(SYS_STATUS_ID) & SYS_STATUS_TXFRS)) {
@@ -1385,6 +1433,8 @@ void PROTOCOL_PollTx(void)
     }
     dwt_write32bitreg(SYS_STATUS_ID, SYS_STATUS_TXFRS);
     tx_periodic_count++;
+
+    HALFDUPLEX_RX_ON();    /* одночиповой полудуплекс: снова слушаем */
 }
 
 /* ===========================================================================
