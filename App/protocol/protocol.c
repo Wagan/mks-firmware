@@ -624,6 +624,34 @@ static bool map_pgdelay(uint8_t channel, uint8_t* out)
     }
 }
 
+/* Sergey/Wagan: 2026-07-22 — MANUAL TX_POWER по каналу/PRF из UM §7.2.31.4 Table 20
+ * (режим DIS_STXP=1). Значения одноктетные (калиброваны под спектральную маску
+ * −41.3 dBm/МГц). out = регистр TX_POWER (0x1E). Канал вне {1..5,7} → false
+ * (симметрично map_pgdelay; ch2-подстановку НЕ делаем — честный пропуск лучше, чем
+ * мощность чужого канала). prf_wire — сырое число (16/64). */
+static bool tx_power_manual(uint8_t channel, uint8_t prf_wire, uint32_t* out)
+{
+    if (prf_wire == 64) {                         /* PRF64 (Mode 3) */
+        switch (channel) {
+            case 1: case 2: *out = 0x67676767u; return true;
+            case 3:         *out = 0x8B8B8B8Bu; return true;
+            case 4:         *out = 0x9A9A9A9Au; return true;
+            case 5:         *out = 0x85858585u; return true;
+            case 7:         *out = 0xD1D1D1D1u; return true;
+            default:        return false;
+        }
+    } else {                                      /* PRF16 */
+        switch (channel) {
+            case 1: case 2: *out = 0x75757575u; return true;
+            case 3:         *out = 0x6F6F6F6Fu; return true;
+            case 4:         *out = 0x5F5F5F5Fu; return true;
+            case 5:         *out = 0x48484848u; return true;
+            case 7:         *out = 0x92929292u; return true;
+            default:        return false;
+        }
+    }
+}
+
 /**
  * @brief SET_PHY_CONFIG (0x10). Настройка PHY DW1000 (dwt_configure).
  *        Параметры (wire, §6, БЕЗ target, 7 байт): channel u8, data_rate u8,
@@ -687,15 +715,17 @@ static ResponseStatus HandleSET_PHY_CONFIG(const uint8_t* params, uint8_t params
 
         /* Sergey/Wagan: 2026-07-22 — штатный 2-й шаг DecaWave: калибровка TX-тракта
          * под канал (PG_DELAY + TX_POWER). Устройство уже выбрано выше. Ручной режим
-         * (DIS_STXP=1) + канальный PGdelay + калиброванный дефолт мощности. Ручная
-         * SET_TX_POWER (0x11) перекрывает этот дефолт. map_pgdelay для валидного канала
-         * всегда true (тот же набор, что map_channel); при false — TX-калибровку
-         * пропускаем, конфиг канала не роняем. */
-        uint8_t pgdly;
-        if (map_pgdelay(channel, &pgdly)) {
+         * (DIS_STXP=1) + канальный PGdelay + КАНАЛЬНЫЙ manual-дефолт TX_POWER из UM
+         * Table 20 (ch2/PRF64 = 0x67676767). Раньше стоял 0x0E080222 — по UM §2.5.5.6
+         * это дефолт ch5 SMART, для ch2/manual неверный (заниженная дальность). Ручная
+         * SET_TX_POWER (0x11) перекрывает этот дефолт. Оба map-а для валидного канала
+         * всегда true; при false — TX-калибровку пропускаем, конфиг канала не роняем. */
+        uint8_t  pgdly;
+        uint32_t txpow;
+        if (map_pgdelay(channel, &pgdly) && tx_power_manual(channel, prf_raw, &txpow)) {
             dwt_txconfig_t txcfg;
-            txcfg.PGdly = pgdly;                 /* ch2 = 0xC2 (TC_PGDELAY_CH2) */
-            txcfg.power = TX_POWER_MAN_DEFAULT;  /* 0x0E080222 (vendor, deca_regs.h) */
+            txcfg.PGdly = pgdly;                 /* канальный PGdelay (ch2 = 0xC2) */
+            txcfg.power = txpow;                 /* Table 20 manual (ch2/PRF64 = 0x67676767) */
             dwt_setsmarttxpower(0);              /* manual (DIS_STXP=1), per-module */
             dwt_configuretxrf(&txcfg);           /* пишет PG_DELAY + TX_POWER */
         }
@@ -1084,23 +1114,40 @@ static ResponseStatus HandleTX_PERIODIC(const uint8_t* params, uint8_t params_le
 }
 
 /**
- * @brief SET_TX_POWER (0x11). Ручная регулировка мощности передатчика (вариант A).
- *        Параметры (wire): power_level u8 — БОЛЬШЕ level → БОЛЬШЕ мощность
- *        (0 ≈ мин, 0xDF ≈ макс), шаг ≈ 0.5 dB. Реализация: octet = 0xFF - level,
- *        дублируется во все 4 октета регистра TX_POWER.
- *        Включает ручной режим (dwt_setsmarttxpower(0), DIS_STXP=1), затем
- *        dwt_configuretxrf. PGdly — по текущему каналу (TC_PGDELAY_CH*).
- *        Применяется на DW_TX_SOURCE_DEV. ТРЕБУЕТ предварительного SET_PHY_CONFIG
- *        (нужен channel; иначе RADIO_ERROR). Ответ DATA: применённый power (u32 LE).
+ * @brief SET_TX_POWER (0x11). Ручная регулировка мощности передатчика. ДВА формата
+ *        по длине params:
+ *          params_len==1: level u8 — БОЛЬШЕ level → БОЛЬШЕ мощность (0 ≈ мин, 0xDF ≈
+ *              макс, шаг ≈ 0.5 dB). Реализация: octet = 0xFF-level ×4 октета (одноктетно
+ *              — покрывает Table 20 manual, все октеты одинаковы).
+ *          params_len==4: tx_power u32 LE — СЫРОЕ значение регистра TX_POWER как есть
+ *              (без клампа) — расширение под будущий smart-режим с разными октетами.
+ *          иначе → INVALID_PARAM.
+ *        Ручной режим (dwt_setsmarttxpower(0), DIS_STXP=1) + dwt_configuretxrf; PGdly —
+ *        по текущему каналу. Применяется на DW_TX_SOURCE_DEV. ТРЕБУЕТ предварительного
+ *        SET_PHY_CONFIG (нужен channel). Ответ DATA: применённый power (u32 LE).
+ *        Перекрывает канальный дефолт, поставленный SET_PHY_CONFIG.
+ * Wagan: 2026-07-22 — добавлен сырой 4-байтовый формат (params_len==4); level-формат
+ *                     (params_len==1) без изменений (обратная совместимость).
  */
 static ResponseStatus HandleSET_TX_POWER(const uint8_t* params, uint8_t params_len,
                                          uint8_t** out_data, uint8_t* out_len)
 {
     *out_len = 0;
 
-    if (params_len < 1) return STATUS_INVALID_PARAM;
-    uint8_t level = params[0];
-    if (level > POWER_LEVEL_MAX) return STATUS_INVALID_PARAM;
+    uint32_t power;
+    if (params_len == 1) {
+        uint8_t level = params[0];
+        if (level > POWER_LEVEL_MAX) return STATUS_INVALID_PARAM;
+        /* Инвертируем: больше level → меньше октет → меньше аттенюация → больше мощность. */
+        uint8_t o = (uint8_t)(0xFF - level);
+        power = ((uint32_t)o << 24) | ((uint32_t)o << 16) | ((uint32_t)o << 8) | (uint32_t)o;
+        tx_power_level = level;
+    } else if (params_len == 4) {
+        power = (uint32_t)params[0] | ((uint32_t)params[1] << 8) |
+                ((uint32_t)params[2] << 16) | ((uint32_t)params[3] << 24);   /* u32 LE, без клампа */
+    } else {
+        return STATUS_INVALID_PARAM;
+    }
 
     if (!dw_dev_state[DW_TX_SOURCE_DEV].initialized) return STATUS_RADIO_ERROR;
 
@@ -1111,25 +1158,21 @@ static ResponseStatus HandleSET_TX_POWER(const uint8_t* params, uint8_t params_l
     if (deca_port_select_device(DW_TX_SOURCE_DEV) != DWT_SUCCESS)
         return STATUS_RADIO_ERROR;
 
-    /* Инвертируем: больше level → меньше октет → меньше аттенюация → больше мощность. */
-    uint8_t o = (uint8_t)(0xFF - level);
     dwt_txconfig_t cfg;
     cfg.PGdly = pgdly;
-    cfg.power = ((uint32_t)o << 24) | ((uint32_t)o << 16) |
-                ((uint32_t)o << 8)  |  (uint32_t)o;
+    cfg.power = power;
 
     dwt_setsmarttxpower(0);      /* ручной режим (DIS_STXP=1) */
     dwt_configuretxrf(&cfg);     /* void */
 
-    tx_power_level = level;
-    tx_power_reg   = cfg.power;
+    tx_power_reg = power;
 
     /* DATA = применённый power (u32 LE) */
     static uint8_t buf[4];
-    buf[0] = (uint8_t)(cfg.power        & 0xFF);
-    buf[1] = (uint8_t)((cfg.power >> 8)  & 0xFF);
-    buf[2] = (uint8_t)((cfg.power >> 16) & 0xFF);
-    buf[3] = (uint8_t)((cfg.power >> 24) & 0xFF);
+    buf[0] = (uint8_t)(power        & 0xFF);
+    buf[1] = (uint8_t)((power >> 8)  & 0xFF);
+    buf[2] = (uint8_t)((power >> 16) & 0xFF);
+    buf[3] = (uint8_t)((power >> 24) & 0xFF);
     *out_data = buf;
     *out_len  = 4;
     return STATUS_OK;
