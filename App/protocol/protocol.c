@@ -634,6 +634,12 @@ static bool map_pgdelay(uint8_t channel, uint8_t* out)
  *        ТРЕБУЕТ ПРЕДВАРИТЕЛЬНОГО INIT: dwt_configure опирается на состояние,
  *        установленное dwt_initialise; если модуль не инициализирован — команда
  *        возвращает RADIO_ERROR. Правильный порядок: INIT → SET_PHY_CONFIG.
+ * Sergey/Wagan: 2026-07-22 — авто-калибровка TX-тракта под канал (штатный 2-й шаг
+ *        DecaWave): после dwt_configure на каждом живом модуле — dwt_setsmarttxpower(0)
+ *        (manual) + dwt_configuretxrf(PGdly=map_pgdelay(channel), power=дефолт).
+ *        Раньше TX_POWER/PG_DELAY выставлялись ТОЛЬКО ручной SET_TX_POWER — станция
+ *        передавала на сбросовом дефолте (низкая дальность). SET_TX_POWER остаётся для
+ *        ручной подстройки уровня поверх этого дефолта.
  */
 static ResponseStatus HandleSET_PHY_CONFIG(const uint8_t* params, uint8_t params_len,
                                            uint8_t** out_data, uint8_t* out_len)
@@ -678,6 +684,21 @@ static ResponseStatus HandleSET_PHY_CONFIG(const uint8_t* params, uint8_t params
 
         if (deca_port_select_device(i) != DWT_SUCCESS) return STATUS_RADIO_ERROR;
         dwt_configure(&cfg);   /* void: валидация уже сделана ДО вызова */
+
+        /* Sergey/Wagan: 2026-07-22 — штатный 2-й шаг DecaWave: калибровка TX-тракта
+         * под канал (PG_DELAY + TX_POWER). Устройство уже выбрано выше. Ручной режим
+         * (DIS_STXP=1) + канальный PGdelay + калиброванный дефолт мощности. Ручная
+         * SET_TX_POWER (0x11) перекрывает этот дефолт. map_pgdelay для валидного канала
+         * всегда true (тот же набор, что map_channel); при false — TX-калибровку
+         * пропускаем, конфиг канала не роняем. */
+        uint8_t pgdly;
+        if (map_pgdelay(channel, &pgdly)) {
+            dwt_txconfig_t txcfg;
+            txcfg.PGdly = pgdly;                 /* ch2 = 0xC2 (TC_PGDELAY_CH2) */
+            txcfg.power = TX_POWER_MAN_DEFAULT;  /* 0x0E080222 (vendor, deca_regs.h) */
+            dwt_setsmarttxpower(0);              /* manual (DIS_STXP=1), per-module */
+            dwt_configuretxrf(&txcfg);           /* пишет PG_DELAY + TX_POWER */
+        }
 
         dw_dev_state[i].channel      = channel;
         dw_dev_state[i].data_rate    = data_rate;
