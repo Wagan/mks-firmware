@@ -178,6 +178,15 @@ EVK). Хостовый исследовательский GUI `tools/mks_gui.py`
 > правилу `data_rate == 110 kbps → nsSFD = 1` (иначе 0), по конвенции EVK/DecaWave.
 > `sfdTO` на первом этапе = 0 → драйверный дефолт `DWT_SFDTOC_DEF`. `phrMode` =
 > `DWT_PHRMODE_STD`.
+>
+> **Калибровка TX-тракта под канал (авто, с 2026-07-22).** `SET_PHY_CONFIG` выполняет
+> **штатный 2-й шаг DecaWave**: после `dwt_configure()` на каждом живом модуле —
+> `dwt_setsmarttxpower(0)` (ручной режим, DIS_STXP=1) + `dwt_configuretxrf()` с
+> `PGdelay = TC_PGDELAY_CH<channel>` (ch2 = `0xC2`) и `power = TX_POWER_MAN_DEFAULT`
+> (`0x0E080222`, vendor-калиброванный дефолт). Раньше `TX_POWER`/`PG_DELAY` выставлялись
+> ТОЛЬКО ручной `SET_TX_POWER` — станция/поток передавали на **сбросовом дефолте**
+> (заниженная дальность). `SET_TX_POWER` (0x11) остаётся для **ручной подстройки
+> уровня** и перекрывает этот дефолт.
 
 ---
 
