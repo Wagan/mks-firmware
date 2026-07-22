@@ -37,13 +37,25 @@
 #define DW_DEV_M1                   0   /* предполагаемо: Источник (TX) */
 #define DW_DEV_M2                   1   /* предполагаемо: Индикатор (RX) */
 
-/* Модуль-приёмник для RX_START/GET_SIGNAL_METRICS. Предположительно Индикатор =
- * M2; если сигнал EVK не слышно — поменять на DW_DEV_M1 (одна строка). */
-#define DW_RX_LISTEN_DEV            DW_DEV_M2
+/* Wagan/Dima: 2026-07-22 — ОДНОКАБЕЛЬНАЯ сборка (проверка гипотезы самоглушения M1→M2,
+ * §15.1). Раскомментировать строку ниже → станция-полудуплекс на ОДНОМ модуле M2 (оба
+ * направления), M1 полностью заглушён (forcetrxoff, не конфигурится). DW_DEVICE_COUNT
+ * остаётся 2 (M2 = индекс 1; INIT должен доходить до него; на плате только с M2 —
+ * INIT переживает). Двухмодульная (M1 TX / M2 RX, CIR/loopback) — при закомментированном
+ * флаге, поведение прежнее. НЕ забыть пересобрать после смены флага. */
+/* #define MKS_SIMPLEX */
 
-/* Модуль-источник для TX_FRAME/TX_STOP. Предположительно Источник = M1; для
- * loopback M1(TX)→M2(RX). Если loopback не пойдёт — поменять строку. */
-#define DW_TX_SOURCE_DEV            DW_DEV_M1
+#ifdef MKS_SIMPLEX
+  /* Однокабельный полудуплекс: оба направления на ОДИН чип M2. */
+  #define DW_RX_LISTEN_DEV          DW_DEV_M2
+  #define DW_TX_SOURCE_DEV          DW_DEV_M2
+  #define DW_SINGLE_MODULE          1     /* гейт полудуплекс-связки + заглушения M1 */
+#else
+  /* Двухмодульная (как сейчас): M2 слушает, M1 передаёт (loopback M1→M2). */
+  #define DW_RX_LISTEN_DEV          DW_DEV_M2
+  #define DW_TX_SOURCE_DEV          DW_DEV_M1
+  #define DW_SINGLE_MODULE          0
+#endif
 
 /* --- Полярность сброса (RST через BSS138). OQ-9: проверить на железе. ---
  * Гипотеза: лог.1 на пине МК -> MOSFET открыт -> RSTn к земле -> сброс актив.
@@ -87,6 +99,7 @@
 #define DW_DEV_M1                   0
 #define DW_RX_LISTEN_DEV            DW_DEV_M1   /* единственный модуль */
 #define DW_TX_SOURCE_DEV            DW_DEV_M1   /* единственный модуль */
+#define DW_SINGLE_MODULE            1           /* один чип → полудуплекс-связка (§15.1) */
 
 #define DW_RST_ACTIVE_HIGH          1   /* прямое подключение, уточнить */
 
