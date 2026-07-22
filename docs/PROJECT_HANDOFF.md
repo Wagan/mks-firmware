@@ -882,6 +882,21 @@ STM32CubeProgrammer: Device ID 0x431 = F411, 3.24V). В CubeIDE: Debugger → Re
 >   Нашли/тестировали Wagan/Andrey; TX-настройку довёл Dima. **Приёмка — замер
 >   дальности (ожидание: скачок к EVK-подобной 5–8 м).** См. `docs\PLAN_rx_hotpath.md`,
 >   `docs\RECON_rx_tuning.md`, `docs\TASK_rx_hotpath.md`.
+> - **Правка 4 (заход 1: однокабельная сборка — гипотеза самоглушения).** Горячий путь
+>   не хватило; гипотеза: в станционном режиме **собственный M1 (TX) глушит собственный
+>   M2 (RX)** на одной плате (−94 dBm на 2 м), тогда как приём от далёкого EVK (5 м) даёт
+>   −95 с рабочим CIR. Разведка `RECON_single_module_halfduplex.md` (`5e9399b`): раздельность
+>   ролей — compile-time `#define`, но **связки RX↔TX на одном чипе не было**.
+>   **Реализована compile-time сборка `MKS_SIMPLEX`** (раскомментировать `#define
+>   MKS_SIMPLEX` в `board_config.h`): полудуплекс на ОДНОМ модуле M2 (роли M2=M2), M1
+>   заглушён (`dwt_forcetrxoff` в INIT, не конфигурится). Связка: `forcetrxoff→starttx→
+>   wait TXFRS→rxenable` в `TX_FRAME`/`PollTx`/`TX_STOP` (под `#if DW_SINGLE_MODULE`;
+>   двухмодульная не затронута). Тот же бинарник работает и на **третьей плате (только
+>   M2)**. **Заход 1 — минимальная проверка гипотезы, БЕЗ Master/Slave** (устранение
+>   коллизий — заход 2). **Приёмка — АСИММЕТРИЧНЫЙ замер:** одна `MKS_SIMPLEX`-плата шлёт
+>   (txperiodic), вторая только слушает (как тест с китами) — даёт ли ОДИН модуль
+>   дальность к EVK (8.5 м) против прежних 2 м. Метки Wagan/Dima. См.
+>   `docs\PLAN_single_module_halfduplex.md`, `docs\TASK_single_module_halfduplex.md`.
 >
 > **Остаток §15.1 по порядку:**
 > 1. ~~**RSSI-в-beacon**~~ — ✅ сделано (см. выше).
