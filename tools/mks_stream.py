@@ -34,19 +34,38 @@ SMARK = b"\xDE\xCA"
 
 
 # Wagan: 2026-07-20 — разбор тела потокового кадра (общий для probe и GUI).
+# Wagan: 2026-07-22 — разбор content=3 (канал данных): PAYLOAD = data_len(u16 LE)+data.
 def parse_stream_body(body: bytes) -> dict:
     """Разобрать тело потокового кадра (SEQ+DROPPED+CONTENT+PAYLOAD, без SMARK/LEN16/
-    CRC). Возвращает dict: seq, dropped, content, metrics (parse_signal_metrics),
-    cir (parse_cir или None — только при content==1). Раскладка: SEQ[0:2],
-    DROPPED[2:4], CONTENT[4], метрики[5:35], CIR с байта 35."""
-    if len(body) < 5 + 30:
-        raise mks.ProtocolError(f"поток: тело короче минимума ({len(body)})")
+    CRC). Возвращает dict: seq, dropped, content, metrics, cir, data.
+      Раскладка общая: SEQ[0:2], DROPPED[2:4], CONTENT[4].
+      content=1: метрики[5:35] + окно CIR[35:]  → metrics, cir; data=None.
+      content=2: метрики[5:35]                  → metrics; cir=None, data=None.
+      content=3: data_len u16 LE [5:7] + data[7:7+data_len] → data (bytes);
+                 metrics=None, cir=None."""
+    if len(body) < 5:
+        raise mks.ProtocolError(f"поток: тело короче заголовка ({len(body)})")
     seq, dropped = struct.unpack_from("<HH", body, 0)
     content = body[4]
+
+    if content == 3:                       # только данные (тело кадра без FCS)
+        if len(body) < 7:
+            raise mks.ProtocolError(f"поток content=3: нет data_len ({len(body)})")
+        data_len = struct.unpack_from("<H", body, 5)[0]
+        if len(body) < 7 + data_len:
+            raise mks.ProtocolError(
+                f"поток content=3: тело короче data_len (нужно {7 + data_len}, есть {len(body)})")
+        data = bytes(body[7:7 + data_len])
+        return {"seq": seq, "dropped": dropped, "content": content,
+                "metrics": None, "cir": None, "data": data}
+
+    # content=1/2: метрики (+CIR)
+    if len(body) < 5 + 30:
+        raise mks.ProtocolError(f"поток: тело короче минимума ({len(body)})")
     metrics = mks.parse_signal_metrics(body[5:35])
     cir = mks.parse_cir(body[35:]) if content == 1 else None
     return {"seq": seq, "dropped": dropped, "content": content,
-            "metrics": metrics, "cir": cir}
+            "metrics": metrics, "cir": cir, "data": None}
 
 
 # Wagan: 2026-07-20 — ре-синхронизация по SMARK: устойчив к мусору/битому CRC (общий).
