@@ -926,11 +926,13 @@ static ResponseStatus HandleGET_CIR(const uint8_t* params, uint8_t params_len,
 
 /**
  * @brief SET_STREAM_MODE (0x42). mode u8: 0=выкл/командный; 1=вкл (метрики+CIR);
- *        2=вкл (только метрики); 3=вкл (только данные — тело принятого кадра без FCS).
+ *        2=вкл (только метрики); 3=вкл (только данные — тело принятого кадра без FCS);
+ *        4=вкл (данные+метрики — тело кадра + блок метрик того же кадра, без CIR).
  *        При ВКЛючении сбрасывает seq/dropped и запоминает содержимое (stream_content).
  *        DATA нет. Потоковые кадры шлёт PROTOCOL_PollRadio (ветка RXFCG) своим
  *        форматом (SMARK 0xDECA).
- * Wagan: 2026-07-22 — добавлен mode=3 (канал данных §15.1 стадия 0): порог 2->3.
+ * Wagan: 2026-07-22 — mode=3 (канал данных, стадия 0) и mode=4 (данные+метрики,
+ *                     RSSI-в-beacon §15.1): порог валидации 2->3->4.
  */
 static ResponseStatus HandleSET_STREAM_MODE(const uint8_t* params, uint8_t params_len,
                                             uint8_t** out_data, uint8_t* out_len)
@@ -940,13 +942,13 @@ static ResponseStatus HandleSET_STREAM_MODE(const uint8_t* params, uint8_t param
 
     if (params_len < 1) return STATUS_INVALID_PARAM;
     uint8_t mode = params[0];
-    if (mode > 3) return STATUS_INVALID_PARAM;
+    if (mode > 4) return STATUS_INVALID_PARAM;
 
     if (mode == 0) {
         stream_active = 0;
     } else {
         stream_seq = 0; stream_dropped = 0;
-        stream_content = mode;         /* 1=метрики+CIR, 2=только метрики, 3=данные */
+        stream_content = mode;         /* 1=метрики+CIR, 2=метрики, 3=данные, 4=данные+метрики */
         stream_active = 1;
     }
     return STATUS_OK;
@@ -1116,17 +1118,20 @@ static ResponseStatus HandleSET_TX_POWER(const uint8_t* params, uint8_t params_l
  * командного): SMARK(0xDE 0xCA) | LEN16 | SEQ | DROPPED | CONTENT | PAYLOAD | CRC8.
  * CONTENT=1 → PAYLOAD = метрики30 + окноCIR; CONTENT=2 → PAYLOAD = метрики30;
  * CONTENT=3 → PAYLOAD = data_len(u16 LE) + data (тело принятого кадра БЕЗ FCS,
- * frame_len-2 байт из rx_frame; НИ метрик, ни CIR).
+ * frame_len-2 байт из rx_frame; НИ метрик, ни CIR);
+ * CONTENT=4 → PAYLOAD = метрики30 + data_len(u16 LE) + data (данные+метрики, БЕЗ CIR;
+ * метрики привязаны к тому же принятому кадру, чьё тело в data → RSSI партнёра).
  * LEN16 = байт после LEN16 и до CRC (SEQ+DROPPED+CONTENT+PAYLOAD); CRC8 по
  * [LEN16..PAYLOAD] (SMARK не входит). При BUSY — дроп: dropped++, SEQ не трогаем.
  * Устройство DW_RX_LISTEN_DEV уже выбрано вызывающим (PollRadio). Окно CIR — весь
  * снимок cir_snap (фикс. полуширина захвата). */
 static void PROTOCOL_SendStreamFrame(void)
 {
-    /* Wagan: 2026-07-22 — content=3 (канал данных §15.1 стадия 0): если тело кадра
-     * не прочитано/пустое (frame_len < 2 или > буфера) — кадр данных НЕ слать. */
+    /* Wagan: 2026-07-22 — content=3/4 несут данные: если тело кадра не прочитано/
+     * пустое (frame_len < 2 или > буфера) — кадр данных НЕ слать (для content=4
+     * «данные+метрики» это значит: нет валидных данных → нечего слать этим кадром). */
     uint16_t data_len = 0;
-    if (stream_content == 3) {
+    if (stream_content == 3 || stream_content == 4) {
         uint16_t fl = rx_metrics.frame_len;
         if (fl < 2u || fl > RX_FRAME_MAX) return;   /* нечего слать / буфер не прочитан */
         data_len = (uint16_t)(fl - 2u);             /* payload без 2-байтного FCS */
@@ -1141,10 +1146,17 @@ static void PROTOCOL_SendStreamFrame(void)
 
     PUT_U16LE(p, stream_seq);     p += 2;   /* SEQ */
     PUT_U16LE(p, stream_dropped); p += 2;   /* DROPPED */
-    *p++ = stream_content;                  /* CONTENT: 1=метрики+CIR, 2=метрики, 3=данные */
+    *p++ = stream_content;                  /* CONTENT: 1=метр+CIR, 2=метр, 3=данные, 4=данные+метр */
 
     if (stream_content == 3) {
         /* Wagan: 2026-07-22 — только данные: data_len + тело кадра (rx_frame) без FCS. */
+        PUT_U16LE(p, data_len);             p += 2;
+        memcpy(p, rx_frame, (size_t)data_len);
+        p += data_len;
+    } else if (stream_content == 4) {
+        /* Wagan: 2026-07-22 — данные+метрики (RSSI-в-beacon, §15.1): метрики 30 Б того
+         * же кадра, затем data_len + тело без FCS. CIR НЕ включается. */
+        p += build_metrics_block(p);        /* 30 байт метрик того же RXFCG-кадра */
         PUT_U16LE(p, data_len);             p += 2;
         memcpy(p, rx_frame, (size_t)data_len);
         p += data_len;
