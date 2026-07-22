@@ -13,6 +13,7 @@
 clear; clc;
 
 % ---------- CONNECT ----------
+% Делаем всё, как было в python скриптах
 % Local serial:
 PORT = "COM3";
 dev = mks_protocol(PORT);
@@ -39,7 +40,7 @@ end
 
 % ---------- SET PHY ----------
 % Dima: 2026-07-20 - default preset Mode 3 (ch2, 110k, PRF64, code9) to listen to EVK kits.
-[st, ~] = dev.set_phy(2, 0, 1024, 9, 64, 32);   % Mode 3
+[st, ~] = dev.set_phy(2, 0, 1024, 9, 64, 32);   % Mode 3 Дима, не забывай про commit/push
 fprintf('SET_PHY  -> %s (Mode 3)\n', mks_protocol.status_name(st));
 
 % ---------- START RX ----------
@@ -71,7 +72,7 @@ for attempt = 1:50
         break;
     end
 end
-if ~got
+if ~got  % пока ничего не разрешаем, если не было приема нормальных пакетов (Это МКС, а не обнаружитель)
     fprintf('No frame received - check the source is on the same PHY mode.\n');
 end
 

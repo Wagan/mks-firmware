@@ -33,6 +33,7 @@ classdef mks_protocol < handle
 %     Sergey — SET_TX_POWER (0x11) manual TX power.
 %     Dima   — default PHY preset (Mode 3, listen to two EVK kits).
 %   Please keep this convention: mark your edits as  <Name>: YYYY-MM-DD - <what/why>.
+%   Стараемся повторить идеологию модулей, как в python-версии
 
     properties (Constant)
         % Wagan: 2026-07-16 - command IDs (docs/PROTOCOL_SPEC.md 5).
@@ -230,6 +231,7 @@ classdef mks_protocol < handle
         function [st,data] = set_tx_power(obj, level)
             % Sergey: 2026-07-17 - SET_TX_POWER (0x11): bigger level = more power; DATA=power u32 LE.
             [st,data] = obj.command(obj.CMD_SET_TX_POWER, uint8(level));
+            % Сережа, ты как Дима, забываешь про commit/push, мы сначала потеряли твою функцию
         end
 
         function [st,data] = tx_frame(obj, payload)
