@@ -51,7 +51,10 @@ typedef enum {
     CMD_GET_SIGNAL_METRICS  = 0x40,
     CMD_GET_CIR             = 0x41,
     CMD_SET_STREAM_MODE     = 0x42,   /* вкл/выкл потоковый режим (CIR-2) */
-    
+    CMD_CIR_RAW_ARM         = 0x43,   /* взвести одиночный сырой съём CIR — обработчик
+                                       * регистрируется ТОЛЬКО под #define RAW_CIR_MONITOR
+                                       * (эксперимент); иначе → STATUS_UNKNOWN_CMD */
+
     /* Эксперименты */
     CMD_START_EXPERIMENT    = 0x50,
     CMD_STOP_EXPERIMENT     = 0x51,

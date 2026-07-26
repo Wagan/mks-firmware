@@ -247,6 +247,35 @@ static uint8_t  stream_content;          /* содержимое: 1=метрик
 static uint16_t stream_seq;              /* номер отправленного потокового кадра */
 static uint16_t stream_dropped;          /* дропнуто по BUSY (нарастающий, u16) */
 
+#ifdef RAW_CIR_MONITOR
+/* ===========================================================================
+ * СЫРОЙ СЪЁМ ВСЕГО АККУМУЛЯТОРА CIR ПО РАННЕМУ СОБЫТИЮ (эксперимент)
+ * ===========================================================================
+ * TASK_raw_cir_monitor / RECON_raw_cir_monitor. Взводится командой CMD_CIR_RAW_ARM
+ * (0x43); при следующем раннем событии приёма (RXSFDD/RXPHE/RXFCE) снимается ВЕСЬ
+ * аккумулятор (992/1016 отсч.) и отдаётся ОДНИМ потоковым кадром CONTENT=5.
+ * Режим ОДИНОЧНЫЙ (авто-разоружение): съём 4066 Б при slow SPI ~29 мс, всё это
+ * время приёмник слеп — непрерывно снимать нельзя (обесценит замер). Отдельно от
+ * cir_snap (окно вокруг FP) — тот не трогаем. FP из LDE здесь НЕ используется
+ * (при RXSFDD не готов; съём с offset 0 в нём не нуждается). */
+#define RAW_CIR_MAX_SAMPLES   1016u                            /* PRF64: весь аккумулятор */
+#define RAW_CIR_BUF_BYTES     (1u + RAW_CIR_MAX_SAMPLES * 4u)  /* dummy(1) + I/Q */
+
+/* Коды события-триггера (поле event в кадре CONTENT=5). */
+#define RAW_CIR_EVT_SFDD      1u    /* RXSFDD — накопление завершено (осн., Б2) */
+#define RAW_CIR_EVT_PHE       2u    /* RXPHE  — кадр не прошёл PHR */
+#define RAW_CIR_EVT_FCE       3u    /* RXFCE  — кадр не прошёл CRC */
+
+static volatile uint8_t raw_cir_armed;    /* 1 = взведён одиночный съём (ARM) */
+static volatile uint8_t raw_cir_pending;  /* 1 = снимок снят, кадр ждёт отправки */
+static uint8_t  raw_cir_event;            /* какое событие вызвало съём */
+static uint8_t  raw_cir_prf;              /* PRF на момент съёма (16/64) */
+static uint16_t raw_cir_count;            /* число отсчётов (992/1016) */
+static uint16_t raw_cir_read_ms;          /* время dwt_readaccdata, мс (замер, Б6 п.4) */
+static uint32_t raw_cir_nosignal;         /* RXPTO при взведённом ARM (детекта не было) */
+static uint8_t  raw_cir_buf[RAW_CIR_BUF_BYTES];  /* dummy(1) + сырой CIR */
+#endif /* RAW_CIR_MONITOR */
+
 /* ===========================================================================
  * ПАРСЕР ВХОДЯЩИХ БАЙТОВ
  * =========================================================================== */
@@ -277,6 +306,12 @@ void PROTOCOL_Init(void)
     stream_content = 1;
     stream_seq     = 0;
     stream_dropped = 0;
+
+#ifdef RAW_CIR_MONITOR
+    raw_cir_armed    = 0;
+    raw_cir_pending  = 0;
+    raw_cir_nosignal = 0;
+#endif
 }
 
 void PROTOCOL_ProcessByte(uint8_t byte)
@@ -493,6 +528,11 @@ static ResponseStatus HandleINIT(const uint8_t* params, uint8_t params_len,
     rx_metrics.valid = 0;
     stream_active    = 0;   /* страховка: гарантированно выйти из потокового режима
                              * (если предыдущее приложение упало с включённым потоком) */
+
+#ifdef RAW_CIR_MONITOR
+    raw_cir_armed    = 0;   /* новая сессия — снять взвод/ожидание сырого съёма */
+    raw_cir_pending  = 0;
+#endif
 
     if (live_count == 0) {
         return STATUS_RADIO_ERROR;    /* нет ни одного живого модуля */
@@ -1041,6 +1081,27 @@ static ResponseStatus HandleSET_STREAM_MODE(const uint8_t* params, uint8_t param
     return STATUS_OK;
 }
 
+#ifdef RAW_CIR_MONITOR
+/**
+ * @brief CMD_CIR_RAW_ARM (0x43) — взвести ОДИНОЧНЫЙ сырой съём всего аккумулятора CIR
+ *        (эксперимент). Params нет, DATA нет. Требует активного приёма (RX_START →
+ *        rx_active): иначе аккумулятор снимать не с чего → STATUS_RADIO_ERROR. Сам
+ *        съём и отправку кадра CONTENT=5 делает PROTOCOL_PollRadio при следующем
+ *        раннем событии (RXSFDD/RXPHE/RXFCE). Взвод одноразовый (авто-разоружение
+ *        после съёма). Регистрируется ТОЛЬКО под RAW_CIR_MONITOR.
+ */
+static ResponseStatus HandleCIR_RAW_ARM(const uint8_t* params, uint8_t params_len,
+                                        uint8_t** out_data, uint8_t* out_len)
+{
+    (void)params; (void)params_len; (void)out_data;
+    *out_len = 0;
+    if (!rx_active) return STATUS_RADIO_ERROR;   /* нужен предварительный RX_START */
+    raw_cir_armed   = 1;
+    raw_cir_pending = 0;
+    return STATUS_OK;
+}
+#endif /* RAW_CIR_MONITOR */
+
 /* Лимиты TX (см. PLAN_tx_tract §9.6). TX_FRAME_MAX — макс. payload (127 макс.
  * стандартный кадр − 2 байта авто-FCS). TX_WAIT_GUARD — потолок busy-wait TXFRS
  * (кадр Mode3 ~сотни мкс; счётчик защищает от вечного цикла). */
@@ -1298,6 +1359,71 @@ static void PROTOCOL_SendStreamFrame(void)
     }
 }
 
+#ifdef RAW_CIR_MONITOR
+/* Снять ВЕСЬ аккумулятор (992/1016 отсч.) в raw_cir_buf. Вызывать ТОЛЬКО ДО
+ * dwt_rxenable и до rxreset (Б4). offset 0 → header 1 байт, первый прочитанный
+ * октет — dummy (отбрасывается при отправке). FP из LDE не нужен (Б1/Б3).
+ * Замер времени dwt_readaccdata — HAL_GetTick (1 мс; для ~29 мс достаточно, Б6 п.4). */
+static void PROTOCOL_CaptureRawCIR(uint8_t event)
+{
+    uint8_t  prf = dw_dev_state[DW_RX_LISTEN_DEV].prf;   /* 16/64 */
+    uint16_t n   = (prf == 64) ? 1016u : 992u;
+    if (n > RAW_CIR_MAX_SAMPLES) n = RAW_CIR_MAX_SAMPLES;
+
+    uint16_t rd_len = (uint16_t)(n * 4u + 1u);           /* dummy(1) + I/Q */
+    uint32_t t0 = HAL_GetTick();
+    dwt_readaccdata(raw_cir_buf, rd_len, 0);             /* весь аккумулятор с offset 0 */
+    uint32_t dt = HAL_GetTick() - t0;
+
+    raw_cir_prf     = prf;
+    raw_cir_count   = n;
+    raw_cir_read_ms = (dt > 0xFFFFu) ? 0xFFFFu : (uint16_t)dt;
+    raw_cir_event   = event;
+    raw_cir_pending = 1;
+    raw_cir_armed   = 0;                                 /* одиночный съём */
+}
+
+/* Отправить кадр полного сырого CIR (CONTENT=5). Каркас — тот же потоковый формат
+ * (SMARK|LEN16|SEQ|DROPPED|CONTENT|PAYLOAD|CRC8), PAYLOAD:
+ *   event u8 | prf u8 | read_ms u16 | sample_count u16 | count×(I int16, Q int16).
+ * Свой большой буфер (не трогает frame[320]). CDC_Transmit_FS отдаёт указатель
+ * напрямую — большой кадр допустим. При CDC BUSY: DROPPED++, pending остаётся
+ * (повтор на следующем PollRadio). SEQ/DROPPED — общие со стримом. */
+static void PROTOCOL_SendRawCirFrame(void)
+{
+    static uint8_t raw_frame[24u + RAW_CIR_MAX_SAMPLES * 4u];  /* с запасом */
+    uint8_t* p = raw_frame;
+
+    *p++ = 0xDE; *p++ = 0xCA;                 /* SMARK */
+    uint8_t* len_field = p; p += 2;           /* место под LEN16 */
+
+    PUT_U16LE(p, stream_seq);     p += 2;     /* SEQ */
+    PUT_U16LE(p, stream_dropped); p += 2;     /* DROPPED */
+    *p++ = 5u;                                /* CONTENT = 5 (полный сырой CIR) */
+
+    *p++ = raw_cir_event;                     /* event: 1=SFDD, 2=PHE, 3=FCE */
+    *p++ = raw_cir_prf;                       /* prf: 16 / 64 */
+    PUT_U16LE(p, raw_cir_read_ms); p += 2;    /* время съёма, мс */
+    PUT_U16LE(p, raw_cir_count);   p += 2;    /* число отсчётов */
+
+    memcpy(p, &raw_cir_buf[1], (size_t)(raw_cir_count * 4u));  /* I/Q без dummy */
+    p += raw_cir_count * 4u;
+
+    uint16_t body_len = (uint16_t)(p - (len_field + 2));
+    PUT_U16LE(len_field, body_len);
+    *p = PROTOCOL_CalculateCRC16len(len_field, (uint16_t)(p - len_field));  /* CRC8 [LEN16..PAYLOAD] */
+    p++;
+
+    uint16_t total = (uint16_t)(p - raw_frame);
+    if (CDC_Transmit_FS(raw_frame, total) == USBD_OK) {
+        stream_seq++;
+        raw_cir_pending = 0;                  /* кадр ушёл */
+    } else {
+        stream_dropped++;                     /* BUSY — повторим на следующем PollRadio */
+    }
+}
+#endif /* RAW_CIR_MONITOR */
+
 /* Снять окно CIR [FP-half .. FP+half] в cir_snap. Активное DW-устройство уже
  * выбрано вызывающим (PollRadio). Полуширина фиксирована CIR_HALF_MAX (окно
  * максимально; GET_CIR при отдаче обрежет до запрошенной клиентом полуширины).
@@ -1351,6 +1477,29 @@ void PROTOCOL_PollRadio(void)
     if (deca_port_select_device(DW_RX_LISTEN_DEV) != DWT_SUCCESS) return;
 
     uint32_t status = dwt_read32bitreg(SYS_STATUS_ID);
+
+#ifdef RAW_CIR_MONITOR
+    /* Эксперимент (TASK_raw_cir_monitor): одиночный сырой съём ВСЕГО аккумулятора по
+     * РАННЕМУ событию, ДО зачёта кадра. Съём — ДО любых dwt_rxenable/rxreset в ветках
+     * ниже (Б4). Флаги RXFCG/ошибок здесь НЕ снимаем — их обрабатывают штатные ветки,
+     * поведение прежнее. Приоритет тегирования: PHE/FCE (кадр провалился, но CIR есть —
+     * главная цель) → SFDD (накопление завершено, Б2; ловит и хорошие кадры для сверки
+     * формы). Непрерывно снимать нельзя: съём ~29 мс держит приёмник слепым. */
+    if (raw_cir_pending) {
+        PROTOCOL_SendRawCirFrame();              /* дослать ждущий кадр (при BUSY — позже) */
+    } else if (raw_cir_armed) {
+        if (status & SYS_STATUS_RXPHE) {
+            PROTOCOL_CaptureRawCIR(RAW_CIR_EVT_PHE);
+        } else if (status & SYS_STATUS_RXFCE) {
+            PROTOCOL_CaptureRawCIR(RAW_CIR_EVT_FCE);
+        } else if (status & SYS_STATUS_RXSFDD) {
+            PROTOCOL_CaptureRawCIR(RAW_CIR_EVT_SFDD);
+        } else if (status & SYS_STATUS_RXPTO) {
+            raw_cir_nosignal++;                  /* детекта преамбулы не было — не триггер */
+            dwt_write32bitreg(SYS_STATUS_ID, SYS_STATUS_RXPTO);  /* снять, чтобы не залипал */
+        }
+    }
+#endif /* RAW_CIR_MONITOR */
 
     if (status & SYS_STATUS_RXFCG) {
         /* Хороший кадр: снять флаг, прочитать длину/данные и метрики. */
@@ -1468,5 +1617,8 @@ void PROTOCOL_RegisterAllHandlers(void)
     PROTOCOL_RegisterHandler(CMD_TX_FRAME,           HandleTX_FRAME);
     PROTOCOL_RegisterHandler(CMD_TX_STOP,            HandleTX_STOP);
     PROTOCOL_RegisterHandler(CMD_TX_PERIODIC,        HandleTX_PERIODIC);
+#ifdef RAW_CIR_MONITOR
+    PROTOCOL_RegisterHandler(CMD_CIR_RAW_ARM,        HandleCIR_RAW_ARM);
+#endif
     /* Остальные CMD_ID остаются NULL → STATUS_UNKNOWN_CMD. */
 }
