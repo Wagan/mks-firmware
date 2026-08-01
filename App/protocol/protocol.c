@@ -1640,7 +1640,9 @@ static void ed_agc_delay_us(uint16_t wait_us)
  * @brief CMD_ED_AGC_SCAN (0x44) — N одиночных замеров фоновой энергии АРУ (эксперимент).
  *        PARAMS: N u8 | wait_us u16 LE (wait_us=0 → дефолт 32 мкс). Ответ: N×3 байта —
  *        младшие 24 бита AGC_STAT1 (EDG1/EDV2) «как есть», LE; распаковку/статистику
- *        делает хост. Предусловие Р3: rx_active==0 (иначе STATUS_RADIO_BUSY).
+ *        делает хост. Предусловия: (1) rx_active==0 (иначе STATUS_RADIO_BUSY, Р3);
+ *        (2) приёмный модуль инициализирован (иначе STATUS_RADIO_ERROR — rx_active==0
+ *        истинно и на неинициализированном модуле, числа были бы бессмысленны).
  *        Каждый отсчёт — полная процедура UM §7.2.36.2, включая вкл/выкл приёмника;
  *        отсчёты независимы. По завершении DIS_AM=1 (сброс), приёмник выключен.
  */
@@ -1657,7 +1659,13 @@ static ResponseStatus HandleED_AGC_SCAN(const uint8_t* params, uint8_t params_le
 
     if (n == 0u || n > ED_AGC_MAX_SAMPLES) return STATUS_INVALID_PARAM;
 
-    if (rx_active) return STATUS_RADIO_BUSY;                 /* Р3: скан только при выключенном приёме */
+    if (rx_active) return STATUS_RADIO_BUSY;                 /* предусловие 1 (Р3): скан только при выключенном приёме */
+
+    /* Предусловие 2: модуль должен быть инициализирован. rx_active==0 истинно и на
+     * НЕинициализированном модуле, поэтому без этой проверки команда вернула бы
+     * правдоподобные, но бессмысленные числа (худший исход для замера). Признак —
+     * существующий флаг .initialized (ставится в INIT). */
+    if (!dw_dev_state[DW_RX_LISTEN_DEV].initialized) return STATUS_RADIO_ERROR;
 
     if (!ed_agc_cyccnt_enable()) return STATUS_INTERNAL_ERROR; /* CYCCNT не идёт — сообщить, не подпирать */
 
