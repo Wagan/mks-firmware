@@ -1594,6 +1594,97 @@ void PROTOCOL_RegisterHandler(CommandID cmd, CommandHandler handler)
     handlers[cmd] = handler;
 }
 
+#ifdef ED_AGC_SCAN
+/* ===========================================================================
+ * ЭД НА АРУ — энергоскан EDG1/EDV2 (эксперимент, TASK_ed_agc_impl / RECON_ed_agc)
+ * ===========================================================================
+ * Процедура энергоизмерения по UM §7.2.36.2 (Energy Scan / ED channel scan): при
+ * DIS_AM=0 и включённом приёмнике АРУ устаканивается на фоновой энергии; результат —
+ * EDG1 (биты 10-6) и EDV2 (биты 19-11; в драйвере это AGC_STAT1_EDG2_MASK — то же поле)
+ * в AGC_STAT1 (0x23:1E). Регистры/маски — только константы из deca_regs.h.
+ * Р3: только при выключенном непрерывном приёме (rx_active==0); PROTOCOL_PollRadio
+ * не трогается. Всё — под #ifdef ED_AGC_SCAN.
+ *
+ * Пауза 32 мкс: своего µs-источника в коде нет (deca_sleep=HAL_Delay мс), поэтому под
+ * этим флагом включаем DWT CYCCNT. Число тактов — из SystemCoreClock (HCLK задаётся в
+ * SystemClock_Config, Core/Src/main.c:159-169; HAL поддерживает SystemCoreClock) —
+ * в рантайме, НЕ хардкод. Длительность паузы — параметр команды wait_us (u16), дефолт
+ * 32 (UM). Регистры ядра — через CMSIS (CoreDebug/DWT), без числовых адресов. */
+#define CMD_ED_AGC_SCAN         0x44u   /* свободен: макс. занятый CMD в protocol.h — 0x43 */
+#define ED_AGC_SAMPLE_BYTES     3u      /* младшие 24 бита AGC_STAT1 «как есть» (ШАГ 3) */
+#define ED_AGC_WAIT_US_DEFAULT  32u     /* UM §7.2.36.2 шаг (d): «Wait 32 µs for the AGC to settle» */
+/* Предел N по DATA (LEN u8: STATUS+DATA<=255 → DATA<=254). */
+#define ED_AGC_MAX_SAMPLES      (254u / ED_AGC_SAMPLE_BYTES)   /* = 84 */
+
+/* Включить счётчик тактов ядра (DWT CYCCNT). Возврат 1, если счётчик реально пошёл. */
+static uint8_t ed_agc_cyccnt_enable(void)
+{
+    CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
+    DWT->CYCCNT = 0;
+    DWT->CTRL  |= DWT_CTRL_CYCCNTENA_Msk;
+    uint32_t a = DWT->CYCCNT;
+    for (volatile uint32_t i = 0; i < 16u; i++) { __NOP(); }   /* дать тактам пройти */
+    return (DWT->CYCCNT != a) ? 1u : 0u;
+}
+
+/* Пауза wait_us мкс по DWT CYCCNT. cycles = (SystemCoreClock/1e6)*wait_us — в рантайме.
+ * Беззнаковая разность (DWT->CYCCNT - start) устойчива к переполнению 32-бит счётчика. */
+static void ed_agc_delay_us(uint16_t wait_us)
+{
+    uint32_t start  = DWT->CYCCNT;
+    uint32_t cycles = (SystemCoreClock / 1000000u) * (uint32_t)wait_us;
+    while ((uint32_t)(DWT->CYCCNT - start) < cycles) { /* busy-wait */ }
+}
+
+/**
+ * @brief CMD_ED_AGC_SCAN (0x44) — N одиночных замеров фоновой энергии АРУ (эксперимент).
+ *        PARAMS: N u8 | wait_us u16 LE (wait_us=0 → дефолт 32 мкс). Ответ: N×3 байта —
+ *        младшие 24 бита AGC_STAT1 (EDG1/EDV2) «как есть», LE; распаковку/статистику
+ *        делает хост. Предусловие Р3: rx_active==0 (иначе STATUS_RADIO_BUSY).
+ *        Каждый отсчёт — полная процедура UM §7.2.36.2, включая вкл/выкл приёмника;
+ *        отсчёты независимы. По завершении DIS_AM=1 (сброс), приёмник выключен.
+ */
+static ResponseStatus HandleED_AGC_SCAN(const uint8_t* params, uint8_t params_len,
+                                        uint8_t** out_data, uint8_t* out_len)
+{
+    static uint8_t buf[ED_AGC_MAX_SAMPLES * ED_AGC_SAMPLE_BYTES];
+    *out_len = 0;
+
+    if (params_len < 3u) return STATUS_INVALID_PARAM;        /* N + wait_us(2) */
+    uint8_t  n       = params[0];
+    uint16_t wait_us = GET_U16LE(&params[1]);
+    if (wait_us == 0u) wait_us = ED_AGC_WAIT_US_DEFAULT;     /* 0 → документированный дефолт */
+
+    if (n == 0u || n > ED_AGC_MAX_SAMPLES) return STATUS_INVALID_PARAM;
+
+    if (rx_active) return STATUS_RADIO_BUSY;                 /* Р3: скан только при выключенном приёме */
+
+    if (!ed_agc_cyccnt_enable()) return STATUS_INTERNAL_ERROR; /* CYCCNT не идёт — сообщить, не подпирать */
+
+    if (deca_port_select_device(DW_RX_LISTEN_DEV) != DWT_SUCCESS) return STATUS_RADIO_ERROR;
+
+    uint8_t* p = buf;
+    for (uint8_t i = 0; i < n; i++) {
+        /* Процедура UM §7.2.36.2 (целиком, на один отсчёт): */
+        dwt_write16bitoffsetreg(AGC_CTRL_ID, AGC_CTRL1_OFFSET, 0x0000u);              /* (b) DIS_AM=0 */
+        dwt_rxenable(DWT_START_RX_IMMEDIATE);                                         /* (c) RXENAB */
+        ed_agc_delay_us(wait_us);                                                     /* (d) пауза ~32 мкс */
+        dwt_write16bitoffsetreg(AGC_CTRL_ID, AGC_CTRL1_OFFSET, AGC_CTRL1_DIS_AM);     /* (e) DIS_AM=1 (заморозка + возврат к сбросу) */
+        uint32_t v = dwt_read32bitoffsetreg(AGC_CTRL_ID, AGC_STAT1_OFFSET);           /* (f) чтение AGC_STAT1 */
+        dwt_forcetrxoff();                                                            /* (g) TRXOFF — приёмник выключен */
+
+        *p++ = (uint8_t)(v);        /* младшие 24 бита AGC_STAT1, LE, без распаковки полей */
+        *p++ = (uint8_t)(v >> 8);
+        *p++ = (uint8_t)(v >> 16);
+    }
+    /* Восстановление состояния: DIS_AM=1 (сбросовое значение), приёмник выключен. */
+
+    *out_data = buf;
+    *out_len  = (uint8_t)(n * ED_AGC_SAMPLE_BYTES);
+    return STATUS_OK;
+}
+#endif /* ED_AGC_SCAN */
+
 /**
  * @brief Регистрация обработчиков команд API.
  *
@@ -1619,6 +1710,9 @@ void PROTOCOL_RegisterAllHandlers(void)
     PROTOCOL_RegisterHandler(CMD_TX_PERIODIC,        HandleTX_PERIODIC);
 #ifdef RAW_CIR_MONITOR
     PROTOCOL_RegisterHandler(CMD_CIR_RAW_ARM,        HandleCIR_RAW_ARM);
+#endif
+#ifdef ED_AGC_SCAN
+    PROTOCOL_RegisterHandler((CommandID)CMD_ED_AGC_SCAN, HandleED_AGC_SCAN);
 #endif
     /* Остальные CMD_ID остаются NULL → STATUS_UNKNOWN_CMD. */
 }
