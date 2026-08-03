@@ -1613,8 +1613,15 @@ void PROTOCOL_RegisterHandler(CommandID cmd, CommandHandler handler)
 #define CMD_ED_AGC_SCAN         0x44u   /* свободен: макс. занятый CMD в protocol.h — 0x43 */
 #define ED_AGC_SAMPLE_BYTES     3u      /* младшие 24 бита AGC_STAT1 «как есть» (ШАГ 3) */
 #define ED_AGC_WAIT_US_DEFAULT  32u     /* UM §7.2.36.2 шаг (d): «Wait 32 µs for the AGC to settle» */
-/* Предел N по DATA (LEN u8: STATUS+DATA<=255 → DATA<=254). */
-#define ED_AGC_MAX_SAMPLES      (254u / ED_AGC_SAMPLE_BYTES)   /* = 84 */
+/* Предел N — из ПОЛНОГО кадра ответа, а НЕ из размера DATA. Кадр =
+ * SYNC(2)+LEN(1)+STATUS(1)+3N+CRC(1) = 5+3N. В PROTOCOL_BuildResponsePacket длина и
+ * индекс пакета имеют тип uint8_t (protocol.c: `uint8_t index` и параметр
+ * `uint8_t* packet_len`, `*packet_len = index`), поэтому кадр ДОЛЖЕН быть ≤255 Б:
+ * при 256+ индекс переполняется, пакет портится, длина обрезается — ответ не уходит,
+ * ошибка не возвращается (см. docs/REPORT_ed_agc_fix.md). 5+3N ≤ 255 → N ≤ 83.
+ * Эмпирика (железо, 01-03.08.2026): N=83 (кадр 254 Б) отвечает, N=84 (257 Б) — нет. */
+#define ED_AGC_RESP_FRAME_MAX   255u   /* потолок кадра из-за uint8_t длины/индекса */
+#define ED_AGC_MAX_SAMPLES      ((ED_AGC_RESP_FRAME_MAX - 5u) / ED_AGC_SAMPLE_BYTES)   /* = 83 */
 
 /* Включить счётчик тактов ядра (DWT CYCCNT). Возврат 1, если счётчик реально пошёл. */
 static uint8_t ed_agc_cyccnt_enable(void)
